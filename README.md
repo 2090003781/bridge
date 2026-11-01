@@ -1,6 +1,6 @@
 # dsh-bridge-connector
 
-Obsidian 侧的 [Bridge](https://github.com/2090003781/obsidian-bridge) 插件的 DSH 伴侣：
+Obsidian 侧的 **Bridge 插件**（跑在 Obsidian 进程内，监听 8811）的 DSH 伴侣：
 在 `127.0.0.1:8812` 起一个回环 HTTP/SSE 服务，让 Obsidian 面板能
 
 - 列出会话、向某个会话发消息、新建会话
@@ -9,11 +9,17 @@ Obsidian 侧的 [Bridge](https://github.com/2090003781/obsidian-bridge) 插件�
 
 它**不是** Obsidian 本人：笔记的读写由 Bridge 插件（Obsidian 内部，8811）完成，这个连接器只负责跟 DSH 对话。
 
+> 配套的 Obsidian 插件不在本仓库里（它是 Obsidian 插件，不是 DSH 插件）。只装这个连接器没有可对话的对端。
+
 ## 安装
 
+市场里点安装即可。手动装：
+
 ```sh
-dsh plugin --profile web add dsh-bridge-connector
+dsh plugin --profile web add https://github.com/2090003781/dsh-bridge-connector/releases/latest/download/dsh-bridge-connector.tgz
 ```
+
+> 没有发布到 npm（npm 现在要求发布时提供 2FA 验证码），所以走 GitHub Release 的预构建 tarball，安装时不需要构建。
 
 装完重启 DSH。服务与 token 信息写在 `~/.dsh-bridge/connector.json`。
 
