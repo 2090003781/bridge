@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.2 — 2026-11-01
+
+- README 顶部改成「一个插件的两头」的说明，并把另一半指向真实存在的
+  [obsidian-bridge](https://github.com/2090003781/obsidian-bridge) 仓库
+
 ## 0.2.1 — 2026-11-01
 
 仅文档：
