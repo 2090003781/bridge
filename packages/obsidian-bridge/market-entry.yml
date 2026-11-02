@@ -1,7 +1,0 @@
-url: https://github.com/2090003781/dsh-bridge-connector
-name: 2090003781/dsh-bridge-connector
-category: remote
-description:
-  en: Loopback bridge that lets an Obsidian plugin drive DSH sessions and inject vault notes into the system prompt.
-  zh: 让 Obsidian 插件驱动 DSH 会话、并把库内笔记注入系统提示词的回环桥。
-tarball: https://github.com/2090003781/dsh-bridge-connector/releases/latest/download/dsh-bridge-connector.tgz
