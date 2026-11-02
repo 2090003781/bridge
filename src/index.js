@@ -10,6 +10,8 @@ import { startConnector } from './core/server.mjs';
 import { renderInjection } from './core/injection.mjs';
 import { createStateStore } from './core/state.mjs';
 
+const INJECTION_FILE = path.join(os.homedir(), '.dsh-bridge', 'injections.json');
+
 export const name = 'bridge-connector';
 export const inject = ['sessionController'];
 
@@ -73,6 +75,7 @@ export async function apply(ctx, config = {}) {
         port: basePort + offset,
         clientTimeZone: localTimeZone(),
         injectionTtlMs: Number(config.injectionTtlMs) || undefined,
+        injectionFile: INJECTION_FILE,
         injectionState,
       });
       break;

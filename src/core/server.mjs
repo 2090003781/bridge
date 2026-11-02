@@ -102,10 +102,11 @@ export function startConnector(options) {
     requestIdPrefix = 'bridge',
     injections = null,
     injectionTtlMs = 0,
+    injectionFile = null,
     injectionState = { on: false },
   } = options;
 
-  const injectionStore = injections || createInjectionStore({ ttlMs: injectionTtlMs });
+  const injectionStore = injections || createInjectionStore({ ttlMs: injectionTtlMs, file: injectionFile });
 
   if (!sessions) throw new Error('startConnector 需要 sessions（sessionController）');
   if (!token) throw new Error('startConnector 需要 token');
@@ -255,9 +256,13 @@ export function startConnector(options) {
       }
       const payload = await readJsonBody(req, res);
       if (!payload) return;
+      // 优先收路径：注入存路径、每轮实时读盘，笔记改了注入就跟着变。
+      // 没有路径时才退回「纯正文快照」（老客户端 / 别处塞内容）。
+      const notePath = payload.path ? String(payload.path) : null;
+      const absPath = payload.absPath ? String(payload.absPath) : null;
       const content = String(payload.content || '');
-      if (!content.trim()) {
-        json(res, 400, { ok: false, error: { code: 'bad-args', message: '缺少 content' } });
+      if (!notePath && !content.trim()) {
+        json(res, 400, { ok: false, error: { code: 'bad-args', message: '缺少 path 或 content' } });
         return;
       }
       if (content.length > MAX_INJECT_CONTENT) {
@@ -283,6 +288,8 @@ export function startConnector(options) {
         const record = injectionStore.add({
           sessionId,
           content,
+          path: notePath,
+          absPath,
           title: payload.title ? String(payload.title) : null,
           kind: payload.kind ? String(payload.kind) : 'context',
         });

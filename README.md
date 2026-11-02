@@ -58,7 +58,9 @@ dsh plugin --profile web add https://github.com/2090003781/dsh-bridge-connector/
 
 - 注入写进系统提示词段（order 250），**下一轮**生效，不写入对话历史
 - 段是进程级的，所有会话共享（包括 QQ 那条线）
-- 注入开关会落盘，DSH 重启后保持上次状态
+- 注入开关会落盘（`~/.dsh-bridge/state.json`），DSH 重启后保持上次状态
+- **注入内容也会落盘**（`~/.dsh-bridge/injections.json`）：DSH 重启后自动读回，不用重新注。要清就手动删单篇或全部清
+  - 注意：内容活过 DSH 重启，**但不会自动过期**——想让它只在一段时间内生效，把 `injectionTtlMs` 设成正数（毫秒）
 - 注入内容有 512KB/篇 的预算：它在系统提示词里，每轮都要重发
 
 ## 测试
