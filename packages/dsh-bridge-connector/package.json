@@ -15,11 +15,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/2090003781/dsh-bridge-connector.git"
+    "url": "git+https://github.com/2090003781/bridge.git",
+    "directory": "packages/dsh-bridge-connector"
   },
-  "homepage": "https://github.com/2090003781/dsh-bridge-connector#readme",
+  "homepage": "https://github.com/2090003781/bridge/tree/main/packages/dsh-bridge-connector#readme",
   "bugs": {
-    "url": "https://github.com/2090003781/dsh-bridge-connector/issues"
+    "url": "https://github.com/2090003781/bridge/issues"
   },
   "dsh": {
     "bundle": {

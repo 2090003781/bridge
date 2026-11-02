@@ -4,7 +4,7 @@
 
 | 这一头 | 那一头 |
 |---|---|
-| **本仓库**：跑在 DSH 进程里的插件，在 `127.0.0.1:8812` 起回环 HTTP/SSE 服务 | [**obsidian-bridge**](https://github.com/2090003781/obsidian-bridge)：跑在 Obsidian 进程里的插件，把命令/编辑器/工作区/库读写暴露成本机 HTTP（8811） |
+| **本仓库**：跑在 DSH 进程里的插件，在 `127.0.0.1:8812` 起回环 HTTP/SSE 服务 | [**obsidian-bridge**](https://github.com/2090003781/bridge/tree/main/packages/obsidian-bridge)：跑在 Obsidian 进程里的插件，把命令/编辑器/工作区/库读写暴露成本机 HTTP（8811） |
 
 两头都装才完整——只装一头没有对端。它让 Obsidian 面板能
 
@@ -14,14 +14,14 @@
 
 它**不是** Obsidian 本人：笔记的读写由 Bridge 插件（Obsidian 内部，8811）完成，这个连接器只负责跟 DSH 对话。
 
-> 配套的 Obsidian 插件在 [obsidian-bridge](https://github.com/2090003781/obsidian-bridge)（它是 Obsidian 插件，不是 DSH 插件，所以不在本仓库）。只装这个连接器没有可对话的对端。
+> 配套的 Obsidian 插件在 [obsidian-bridge](https://github.com/2090003781/bridge/tree/main/packages/obsidian-bridge)（它是 Obsidian 插件，不是 DSH 插件，所以不在本仓库）。只装这个连接器没有可对话的对端。
 
 ## 安装
 
 市场里点安装即可。手动装：
 
 ```sh
-dsh plugin --profile web add https://github.com/2090003781/dsh-bridge-connector/releases/latest/download/dsh-bridge-connector.tgz
+dsh plugin --profile web add https://github.com/2090003781/bridge/releases/latest/download/dsh-bridge-connector.tgz
 ```
 
 > 没有发布到 npm（npm 现在要求发布时提供 2FA 验证码），所以走 GitHub Release 的预构建 tarball，安装时不需要构建。

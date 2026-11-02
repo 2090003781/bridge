@@ -10,7 +10,7 @@
 
 | 这一头 | 那一头 |
 |---|---|
-| **本仓库**：跑在 Obsidian 进程里的插件，把命令面板 / 编辑器 / 工作区 / 库读写暴露成本机 HTTP（8811） | [**dsh-bridge-connector**](https://github.com/2090003781/dsh-bridge-connector)：跑在 DSH 进程里的插件，让 DSH 能跟 Obsidian 对话、把笔记注入系统提示词（8812） |
+| **本仓库**：跑在 Obsidian 进程里的插件，把命令面板 / 编辑器 / 工作区 / 库读写暴露成本机 HTTP（8811） | [**dsh-bridge-connector**](https://github.com/2090003781/bridge/tree/main/packages/dsh-bridge-connector)：跑在 DSH 进程里的插件，让 DSH 能跟 Obsidian 对话、把笔记注入系统提示词（8812） |
 
 两头都装才完整——只装一头没有对端。这一头**不自管启停**：Obsidian 开着它就在，由 DSH 那头观察。
 
