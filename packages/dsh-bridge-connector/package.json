@@ -1,0 +1,42 @@
+{
+  "name": "dsh-bridge-connector",
+  "version": "0.3.0",
+  "description": "Loopback bridge that lets an Obsidian plugin drive DSH sessions and inject vault notes into the system prompt.",
+  "type": "module",
+  "main": "./src/index.js",
+  "license": "MIT",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek",
+    "deepseek-harness",
+    "obsidian",
+    "bridge",
+    "context-injection"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/2090003781/dsh-bridge-connector.git"
+  },
+  "homepage": "https://github.com/2090003781/dsh-bridge-connector#readme",
+  "bugs": {
+    "url": "https://github.com/2090003781/dsh-bridge-connector/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "author": "Charlie_Null"
+}
