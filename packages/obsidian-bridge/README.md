@@ -83,10 +83,10 @@ MCP 工具对应：`obsidian_health` / `obsidian_ops` / `obsidian_commands` / `o
 
 ```powershell
 # 1. 打包（把 src/lib 内联成单文件 main.js——Obsidian 不认插件内的相对 require）
-node D:\obsidian-bridge\scripts\build.js
+node packages/obsidian-bridge/scripts/build.js
 
 # 2. 部署到库
-powershell -File D:\obsidian-bridge\scripts\deploy.ps1 -Vault "D:\个人数据\辞玖"
+powershell -File packages/obsidian-bridge/scripts/deploy.ps1 -Vault "D:\个人数据\辞玖"
 
 # 3. 在 .obsidian/community-plugins.json 里启用 "obsidian-bridge"，重启 Obsidian
 #    状态栏出现「Bridge :8811」即成功
@@ -102,7 +102,7 @@ DSH 侧配置（已追加到 `~/.dsh/profiles/web/cordis.patch.yml`）：
         serverName: bridge
         transport: stdio
         command: 'C:\Program Files\nodejs\node.exe'
-        args: ['D:/obsidian-bridge/scripts/mcp-bridge.js']
+        args: ['D:/bridge/packages/obsidian-bridge/scripts/mcp-bridge.js']
         toolCallTimeoutMs: 60000
         failOnStartupError: false
 ```
@@ -202,7 +202,7 @@ Bridge 在 Obsidian 里有三处界面：
 ## 自测
 
 ```powershell
-node D:\obsidian-bridge\scripts\self-check.mjs   # 44 项，覆盖鉴权/权限/边界/读写回/注入/持久化/路径
+node packages/obsidian-bridge/scripts/self-check.mjs   # 44 项，覆盖鉴权/权限/边界/读写回/注入/持久化/路径
 node --test                                        # 128 项单元测试
 ```
 
@@ -232,7 +232,7 @@ node --test                                        # 128 项单元测试
 ## 目录
 
 ```
-D:\obsidian-bridge\
+packages/obsidian-bridge\
 ├─ src\main.js          插件入口（Obsidian 粘合层）
 ├─ src\lib\             纯逻辑（可脱离 Obsidian 测试）
 ├─ test\                node:test

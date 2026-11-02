@@ -5,7 +5,7 @@ const crypto = require('node:crypto');
 
 const A = 'D:/枢阁/库';
 const B = 'D:/个人数据/辞玖';
-const BACKUP = 'D:/obsidian-bridge/_sync-backup';
+const BACKUP = path.join(__dirname, '..', '_sync-backup');
 const APPLY = process.argv.includes('--apply');
 
 const SKIP_DIRS = new Set(['.git', '.obsidian', '.库元数据', '.trash', '.smart-env', '.claude']);

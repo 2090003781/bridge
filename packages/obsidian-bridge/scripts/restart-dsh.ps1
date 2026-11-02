@@ -1,5 +1,5 @@
 # 重启 DSH web（Bridge 注入 / 连接器新代码需要重启才生效）
-# 用法：powershell -NoProfile -ExecutionPolicy Bypass -File D:\obsidian-bridge\scripts\restart-dsh.ps1
+# 用法：powershell -NoProfile -ExecutionPolicy Bypass -File .\restart-dsh.ps1
 $ErrorActionPreference = "Stop"
 # 自动探测 node（避免把安装路径写死）
 $node = (Get-Command node -ErrorAction SilentlyContinue)?.Source

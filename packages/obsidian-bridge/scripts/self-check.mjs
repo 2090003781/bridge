@@ -4,6 +4,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+// 路径一律从脚本自己的位置推，不写死哪个盘——仓库搬家不该改脚本。
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const info = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.obsidian-bridge', 'info.json'), 'utf8'));
 const base = `http://${info.host}:${info.port}`;
@@ -444,7 +448,7 @@ await test('插件目录与库路径一致（非硬编码）', async () => {
 });
 
 await test('生产代码没有硬编码盘符', async () => {
-  const srcDir = 'D:/obsidian-bridge/src';
+  const srcDir = path.join(REPO_ROOT, 'src');
   const bad = [];
   const walk = (dir) => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -464,7 +468,7 @@ await test('生产代码没有硬编码盘符', async () => {
 
 // ── H. MCP 桥 ──
 await test('MCP 桥 initialize + tools/list', async () => {
-  const r = spawnSync(process.execPath, ['D:/obsidian-bridge/scripts/mcp-bridge.js'], {
+  const r = spawnSync(process.execPath, [path.join(REPO_ROOT, 'scripts', 'mcp-bridge.js')], {
     input: '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n',
     encoding: 'utf8',
     timeout: 20000,

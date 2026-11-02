@@ -1,11 +1,11 @@
 # Bridge 启动优化 · Windows Defender 排除项（需要管理员）
 # 用法：右键「以管理员身份运行 PowerShell」，然后：
-#   powershell -NoProfile -ExecutionPolicy Bypass -File D:\obsidian-bridge\scripts\defender-exclude.ps1
+#   powershell -NoProfile -ExecutionPolicy Bypass -File .\defender-exclude.ps1
 $paths = @(
   'C:\Users\20900\AppData\Roaming\npm\node_modules',
   'C:\Python311',
   'C:\Users\20900\.dsh',
-  'D:\obsidian-bridge',
+  $PSScriptRoot
   'D:\qq-bridge',
   'E:\VMs\_tools'
 )

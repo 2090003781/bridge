@@ -1,10 +1,12 @@
 'use strict';
 const { spawn } = require('node:child_process');
+const path = require('node:path');
+const REPO_ROOT = path.resolve(__dirname, '..');
 
 const servers = [
   { name: 'win11vm', cmd: 'C:\\Python311\\python.exe', args: ['E:/VMs/_tools/vm_mcp.py'], cwd: 'E:/VMs/_tools' },
   { name: 'web-search-safe', cmd: 'C:\\Program Files\\nodejs\\node.exe', args: ['D:\\qq-bridge\\src\\mcp-web-search-safe.js'], cwd: 'D:\\qq-bridge' },
-  { name: 'bridge', cmd: 'C:\\Program Files\\nodejs\\node.exe', args: ['D:/obsidian-bridge/scripts/mcp-bridge.js'], cwd: 'D:\\obsidian-bridge' },
+  { name: 'bridge', cmd: 'C:\\Program Files\\nodejs\\node.exe', args: [path.join(REPO_ROOT, 'scripts', 'mcp-bridge.js')], cwd: REPO_ROOT },
 ];
 
 function timeOne(s) {
