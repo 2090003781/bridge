@@ -1,7 +1,7 @@
 {
   "id": "obsidian-bridge",
   "name": "Bridge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "minAppVersion": "1.5.0",
   "description": "把 Obsidian 内部能力（命令面板等）通过本地网桥暴露给 DSH 与 agent。",
   "author": "辞玖",

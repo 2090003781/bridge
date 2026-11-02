@@ -1,6 +1,6 @@
 {
   "name": "obsidian-bridge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Bridge —— Obsidian 侧能力端：把 Obsidian 内部能力暴露给 DSH / agent",
   "type": "commonjs",

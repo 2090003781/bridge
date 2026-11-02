@@ -340,20 +340,21 @@ class BridgeChatView extends ItemView {
       return;
     }
     try {
-      const text = await this.app.vault.cachedRead(file);
-      const body = [
-        `路径：${file.path}`,
-        selection ? `选中内容：\n${selection}` : '',
-        `正文：\n${text}`,
-      ].filter(Boolean).join('\n\n');
+      // 只送路径，不送正文：连接器每轮自己去读磁盘，笔记改了注入就跟着变。
+      // 未保存的改动本来就不该被注入——读到的是磁盘上的那一份。
+      const base = this.app.vault.adapter.getBasePath();
+      const absPath = base ? String(base).replace(/[\\/]+$/, '') + '/' + file.path : null;
       const res = await this.plugin.connector().inject({
         sessionId: this.sessionId,
-        content: body,
+        path: file.path,
+        absPath,
+        content: selection || '',
         title: file.path,
         kind: 'note',
       });
       if (res && res.ok) {
-        this.pushSystem(`已注入《${file.path}》（${text.length} 字）。下一轮模型上下文就会带上，不占对话历史。`);
+        const extra = selection ? `（另附选中 ${selection.length} 字）` : '';
+        this.pushSystem(`已注入《${file.path}》${extra}——实时跟随磁盘内容，笔记改了下一轮就跟着变。`);
         this.refreshRemoteState();
       } else {
         this.pushSystem('注入失败：' + ((res && res.error && res.error.message) || '未知原因'));
