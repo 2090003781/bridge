@@ -202,6 +202,10 @@ class BridgeChatView extends ItemView {
 
   async ensureSession() {
     const client = this.plugin.connector();
+    // 面板一打开就把库目录注册成工作区（后台跑，不阻塞）：
+    // 否则从这建的会话在 DSH 侧栏里会一直落进「未分组」。
+    if (this.plugin.connector().info()) this.ensureWorkspace().catch(() => {});
+
     if (!client.info()) {
       this.setStatus('DSH 连接器未就绪');
       this.pushSystem('没有找到 ~/.dsh-bridge/connector.json：确认 DSH 正在运行，并且 dsh-bridge-connector 已加载。');
@@ -301,10 +305,10 @@ class BridgeChatView extends ItemView {
     }
     const base = this.app.vault.adapter.getBasePath();
     const workspaceId = await this.ensureWorkspace();
-    const created = await client.createSession({
-      ...(base ? { cwd: base } : {}),
-      ...(workspaceId ? { workspaceId } : {}),
-    });
+    // workspaceId 和 cwd 只能二选一（DSH 会直接拒），工作区自带路径
+    const created = await client.createSession(
+      workspaceId ? { workspaceId } : base ? { cwd: base } : {}
+    );
     if (!created || created.ok !== true) {
       this.pushSystem('新建会话失败：' + ((created && created.error && created.error.message) || '未知原因'));
       return;

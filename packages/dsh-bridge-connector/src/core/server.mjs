@@ -321,9 +321,14 @@ export function startConnector(options) {
       const payload = await readJsonBody(req, res);
       if (!payload) return;
       try {
+        // workspaceId 和 cwd 互斥：有工作区就用工作区（它自带路径）
+        const target = payload.workspaceId
+          ? { workspaceId: payload.workspaceId }
+          : payload.cwd
+            ? { cwd: payload.cwd }
+            : {};
         const created = await sessions.create({
-          ...(payload.cwd ? { cwd: payload.cwd } : {}),
-          ...(payload.workspaceId ? { workspaceId: payload.workspaceId } : {}),
+          ...target,
           ...(payload.agentPreset ? { agentPreset: payload.agentPreset } : {}),
         });
         json(res, 200, { ok: true, data: { sessionId: created.sessionId } });
