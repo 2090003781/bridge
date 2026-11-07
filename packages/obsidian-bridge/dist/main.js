@@ -272,6 +272,27 @@ class BridgeChatView extends ItemView {
     }).open();
   }
 
+  // 确保当前库目录在 DSH 里是一个工作区：没有就注册一个（标题用库名）。
+  // 不注册的话，从面板新建的会话在 DSH 侧栏里会落进「未分组」。
+  async ensureWorkspace() {
+    try {
+      const base = this.app.vault.adapter.getBasePath();
+      if (!base) return null;
+      const client = this.plugin.connector();
+      const res = await client.workspaces();
+      if (!res || res.ok !== true) return null;
+      if (res.data && res.data.available === false) return null;
+      const norm = (v) => String(v || '').replace(/[\\/]+/g, '\\').replace(/\\+$/, '').toLowerCase();
+      const hit = (res.data.workspaces || []).find((w) => norm(w.path) === norm(base));
+      if (hit) return hit.workspaceId;
+      const created = await client.createWorkspace({ path: base, title: this.app.vault.getName() });
+      if (created && created.ok) return created.data.workspaceId;
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
   async createAndBind() {
     const client = this.plugin.connector();
     if (!client.info()) {
@@ -279,7 +300,11 @@ class BridgeChatView extends ItemView {
       return;
     }
     const base = this.app.vault.adapter.getBasePath();
-    const created = await client.createSession(base ? { cwd: base } : {});
+    const workspaceId = await this.ensureWorkspace();
+    const created = await client.createSession({
+      ...(base ? { cwd: base } : {}),
+      ...(workspaceId ? { workspaceId } : {}),
+    });
     if (!created || created.ok !== true) {
       this.pushSystem('新建会话失败：' + ((created && created.error && created.error.message) || '未知原因'));
       return;
@@ -1001,6 +1026,9 @@ function createConnectorClient(options = {}) {
   transcript: (sessionId, limit = 20) =>
     request(`/transcript?sessionId=${encodeURIComponent(sessionId)}&limit=${limit}`, { method: 'GET' }),
     createSession: (payload = {}) => request('/session', { method: 'POST', body: payload }),
+    // 工作区：新建会话要挂到某个工作区，否则 DSH 侧栏里会落进「未分组」
+    workspaces: () => request('/workspaces', { method: 'GET' }),
+    createWorkspace: (payload) => request('/workspace', { method: 'POST', body: payload }),
     sendTask: (payload) => request('/task', { method: 'POST', body: payload }),
     inject: (payload) => request('/inject', { method: 'POST', body: payload }),
     config: () => request('/config'),
@@ -2726,9 +2754,12 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
     // 上次面板是开着的就自动恢复：改代码后 reload、或者重启 Obsidian，
     // 侧栏那个视图会被一起收掉，不该让主人每次都手动点回来。
     if (this.settings.chatOpen) {
-      this.app.workspace.onLayoutReady(() => {
+      // onLayoutReady 在有些 reload 场景下不会再来一次（布局早就 ready 了），
+      // 所以直接延迟开：给 Obsidian 留出重建右侧栏的时间。
+      const timer = setTimeout(() => {
         this.activateChat();
-      });
+      }, 1500);
+      this.register(() => clearTimeout(timer));
     }
 
     // token 轮换不是轮询：一次性算好下次该换的时刻，挂一个 setTimeout。

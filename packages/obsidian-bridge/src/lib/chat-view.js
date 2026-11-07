@@ -259,6 +259,27 @@ class BridgeChatView extends ItemView {
     }).open();
   }
 
+  // 确保当前库目录在 DSH 里是一个工作区：没有就注册一个（标题用库名）。
+  // 不注册的话，从面板新建的会话在 DSH 侧栏里会落进「未分组」。
+  async ensureWorkspace() {
+    try {
+      const base = this.app.vault.adapter.getBasePath();
+      if (!base) return null;
+      const client = this.plugin.connector();
+      const res = await client.workspaces();
+      if (!res || res.ok !== true) return null;
+      if (res.data && res.data.available === false) return null;
+      const norm = (v) => String(v || '').replace(/[\\/]+/g, '\\').replace(/\\+$/, '').toLowerCase();
+      const hit = (res.data.workspaces || []).find((w) => norm(w.path) === norm(base));
+      if (hit) return hit.workspaceId;
+      const created = await client.createWorkspace({ path: base, title: this.app.vault.getName() });
+      if (created && created.ok) return created.data.workspaceId;
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
   async createAndBind() {
     const client = this.plugin.connector();
     if (!client.info()) {
@@ -266,7 +287,11 @@ class BridgeChatView extends ItemView {
       return;
     }
     const base = this.app.vault.adapter.getBasePath();
-    const created = await client.createSession(base ? { cwd: base } : {});
+    const workspaceId = await this.ensureWorkspace();
+    const created = await client.createSession({
+      ...(base ? { cwd: base } : {}),
+      ...(workspaceId ? { workspaceId } : {}),
+    });
     if (!created || created.ok !== true) {
       this.pushSystem('新建会话失败：' + ((created && created.error && created.error.message) || '未知原因'));
       return;

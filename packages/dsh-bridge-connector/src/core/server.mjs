@@ -153,6 +153,7 @@ export function startConnector(options) {
     injections = null,
     injectionTtlMs = 0,
     injectionFile = null,
+    workspaceRegistry = null,
     injectionState = { on: false },
   } = options;
 
@@ -266,11 +267,65 @@ export function startConnector(options) {
       return;
     }
 
+    // 工作区：Obsidian 这边新建会话要挂到某个工作区，不然 DSH 侧栏里会落进「未分组」
+    if (req.method === 'GET' && path === '/workspaces') {
+      if (!workspaceRegistry) {
+        json(res, 200, { ok: true, data: { available: false, workspaces: [] } });
+        return;
+      }
+      try {
+        const list = typeof workspaceRegistry.list === 'function' ? workspaceRegistry.list() : [];
+        const workspaces = (Array.isArray(list) ? list : []).map((w) => ({
+          workspaceId: w && w.id ? String(w.id) : null,
+          path: w && w.path ? String(w.path) : null,
+          title: w && w.title ? String(w.title) : null,
+          sessionCount: Array.isArray(w && w.sessionIds) ? w.sessionIds.length : 0,
+        }));
+        json(res, 200, { ok: true, data: { available: true, workspaces } });
+      } catch (err) {
+        json(res, 500, { ok: false, error: { code: 'workspace-list-failed', message: String(err?.message || err) } });
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && path === '/workspace') {
+      const payload = await readJsonBody(req, res);
+      if (!payload) return;
+      if (!workspaceRegistry || typeof workspaceRegistry.create !== 'function') {
+        json(res, 501, { ok: false, error: { code: 'unsupported', message: '这个 DSH 没有工作区服务' } });
+        return;
+      }
+      const dir = String(payload.path || '').trim();
+      const title = payload.title ? String(payload.title) : undefined;
+      if (!dir) {
+        json(res, 400, { ok: false, error: { code: 'bad-args', message: '缺少 path' } });
+        return;
+      }
+      try {
+        const created = await workspaceRegistry.create(dir, title);
+        json(res, 200, {
+          ok: true,
+          data: {
+            workspaceId: created && created.id ? String(created.id) : null,
+            path: created && created.path ? String(created.path) : dir,
+            title: created && created.title ? String(created.title) : title || null,
+          },
+        });
+      } catch (err) {
+        json(res, 500, { ok: false, error: { code: 'workspace-create-failed', message: String(err?.message || err) } });
+      }
+      return;
+    }
+
     if (req.method === 'POST' && path === '/session') {
       const payload = await readJsonBody(req, res);
       if (!payload) return;
       try {
-        const created = await sessions.create({ ...(payload.cwd ? { cwd: payload.cwd } : {}), ...(payload.agentPreset ? { agentPreset: payload.agentPreset } : {}) });
+        const created = await sessions.create({
+          ...(payload.cwd ? { cwd: payload.cwd } : {}),
+          ...(payload.workspaceId ? { workspaceId: payload.workspaceId } : {}),
+          ...(payload.agentPreset ? { agentPreset: payload.agentPreset } : {}),
+        });
         json(res, 200, { ok: true, data: { sessionId: created.sessionId } });
       } catch (err) {
         json(res, 500, { ok: false, error: { code: 'create-failed', message: String(err?.message || err) } });

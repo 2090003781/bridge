@@ -46,6 +46,9 @@ function localTimeZone() {
 }
 
 export async function apply(ctx, config = {}) {
+  // 工作区服务是可选的：拿不到就降级（不注册工作区，会话照常能建）
+  const workspaceRegistry = typeof ctx.get === 'function' ? ctx.get('workspaceRegistry') || null : null;
+
   const basePort = Number(config.port) || 8812;
   const host = '127.0.0.1';
   const token = config.token || loadToken();
@@ -77,6 +80,7 @@ export async function apply(ctx, config = {}) {
         injectionTtlMs: Number(config.injectionTtlMs) || undefined,
         injectionFile: INJECTION_FILE,
         injectionState,
+        workspaceRegistry,
       });
       break;
     } catch (error) {

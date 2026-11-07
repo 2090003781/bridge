@@ -140,6 +140,9 @@ function createConnectorClient(options = {}) {
   transcript: (sessionId, limit = 20) =>
     request(`/transcript?sessionId=${encodeURIComponent(sessionId)}&limit=${limit}`, { method: 'GET' }),
     createSession: (payload = {}) => request('/session', { method: 'POST', body: payload }),
+    // 工作区：新建会话要挂到某个工作区，否则 DSH 侧栏里会落进「未分组」
+    workspaces: () => request('/workspaces', { method: 'GET' }),
+    createWorkspace: (payload) => request('/workspace', { method: 'POST', body: payload }),
     sendTask: (payload) => request('/task', { method: 'POST', body: payload }),
     inject: (payload) => request('/inject', { method: 'POST', body: payload }),
     config: () => request('/config'),

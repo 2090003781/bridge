@@ -71,9 +71,12 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
     // 上次面板是开着的就自动恢复：改代码后 reload、或者重启 Obsidian，
     // 侧栏那个视图会被一起收掉，不该让主人每次都手动点回来。
     if (this.settings.chatOpen) {
-      this.app.workspace.onLayoutReady(() => {
+      // onLayoutReady 在有些 reload 场景下不会再来一次（布局早就 ready 了），
+      // 所以直接延迟开：给 Obsidian 留出重建右侧栏的时间。
+      const timer = setTimeout(() => {
         this.activateChat();
-      });
+      }, 1500);
+      this.register(() => clearTimeout(timer));
     }
 
     // token 轮换不是轮询：一次性算好下次该换的时刻，挂一个 setTimeout。
