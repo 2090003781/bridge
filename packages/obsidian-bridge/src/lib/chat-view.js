@@ -2,7 +2,7 @@
 // Bridge · 主面板（整合视图）
 // 左 1/3：状态、功能按钮、最近操作记录；右 2/3：与 DSH 会话的对话。
 
-const { ItemView, Notice, Modal, Setting, TFolder } = require('obsidian');
+const { ItemView, Notice, Modal, Setting, TFolder, MarkdownRenderer } = require('obsidian');
 const fs = require('node:fs');
 const { parseLedger } = require('./ledger-reader.js');
 const { reconcileInjection } = require('./settings.js');
@@ -60,6 +60,9 @@ class BridgeChatView extends ItemView {
   }
 
   onClose() {
+    // 用户主动关掉面板：下次启动别再自己弹出来
+    this.plugin.settings.chatOpen = false;
+    this.plugin.persistSettings();
     if (this.sideTimer) {
       clearInterval(this.sideTimer);
       this.sideTimer = null;
@@ -217,6 +220,7 @@ class BridgeChatView extends ItemView {
     this.setStatus('已连接');
     this.refreshLocalState();
     this.connect();
+    this.loadHistory();
   }
 
   // 拉会话列表 → 弹树（工作区 → 会话），选中就绑定
@@ -256,6 +260,23 @@ class BridgeChatView extends ItemView {
     }
     this.bindSession(created.data.sessionId);
     new Notice('已新建 Bridge 会话');
+  }
+
+  // reload 后把会话里最近的消息读回来：面板自己不存历史，消息都在 DSH 那边
+  async loadHistory() {
+    if (!this.sessionId) return;
+    try {
+      const res = await this.plugin.connector().transcript(this.sessionId, 20);
+      if (!res || res.ok !== true) return;
+      const items = (res.data && res.data.messages) || [];
+      if (!items.length) return;
+      // 载入期间用户可能已经发过消息，别覆盖掉
+      if (this.messages.length > 0) return;
+      this.messages = items.map((m) => ({ role: m.role, text: m.text }));
+      this.render();
+    } catch {
+      /* 读历史失败不影响发消息 */
+    }
   }
 
   connect() {
@@ -409,16 +430,27 @@ class BridgeChatView extends ItemView {
     this.render();
   }
 
+  // Obsidian 自带渲染器；失败就退回纯文本，不能让一条消息把面板弄崩。
+  renderMarkdown(el, text) {
+    try {
+      MarkdownRenderer.render(this.app, String(text || ''), el, '', this);
+    } catch {
+      el.setText(String(text || ''));
+    }
+  }
+
   render() {
     if (!this.listEl) return;
     this.listEl.empty();
     for (const msg of this.messages) {
       const el = this.listEl.createDiv({ cls: `bridge-msg bridge-msg-${msg.role}` });
-      el.setText(msg.text);
+      // 助手回复按 Markdown 渲染（代码块、列表、粗体），用户自己的话保持纯文本
+      if (msg.role === 'assistant') this.renderMarkdown(el, msg.text);
+      else el.setText(msg.text);
     }
     if (this.assistantBuffer) {
       const el = this.listEl.createDiv({ cls: 'bridge-msg bridge-msg-assistant bridge-msg-streaming' });
-      el.setText(this.assistantBuffer);
+      this.renderMarkdown(el, this.assistantBuffer);
     }
     this.listEl.scrollTop = this.listEl.scrollHeight;
   }

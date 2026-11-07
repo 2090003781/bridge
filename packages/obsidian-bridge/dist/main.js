@@ -15,7 +15,7 @@ __define('lib/chat-view.js', function (module, exports, require) {
 // Bridge · 主面板（整合视图）
 // 左 1/3：状态、功能按钮、最近操作记录；右 2/3：与 DSH 会话的对话。
 
-const { ItemView, Notice, Modal, Setting, TFolder } = require('obsidian');
+const { ItemView, Notice, Modal, Setting, TFolder, MarkdownRenderer } = require('obsidian');
 const fs = require('node:fs');
 const { parseLedger } = __req('lib/ledger-reader.js');
 const { reconcileInjection } = __req('lib/settings.js');
@@ -73,6 +73,9 @@ class BridgeChatView extends ItemView {
   }
 
   onClose() {
+    // 用户主动关掉面板：下次启动别再自己弹出来
+    this.plugin.settings.chatOpen = false;
+    this.plugin.persistSettings();
     if (this.sideTimer) {
       clearInterval(this.sideTimer);
       this.sideTimer = null;
@@ -230,6 +233,7 @@ class BridgeChatView extends ItemView {
     this.setStatus('已连接');
     this.refreshLocalState();
     this.connect();
+    this.loadHistory();
   }
 
   // 拉会话列表 → 弹树（工作区 → 会话），选中就绑定
@@ -269,6 +273,23 @@ class BridgeChatView extends ItemView {
     }
     this.bindSession(created.data.sessionId);
     new Notice('已新建 Bridge 会话');
+  }
+
+  // reload 后把会话里最近的消息读回来：面板自己不存历史，消息都在 DSH 那边
+  async loadHistory() {
+    if (!this.sessionId) return;
+    try {
+      const res = await this.plugin.connector().transcript(this.sessionId, 20);
+      if (!res || res.ok !== true) return;
+      const items = (res.data && res.data.messages) || [];
+      if (!items.length) return;
+      // 载入期间用户可能已经发过消息，别覆盖掉
+      if (this.messages.length > 0) return;
+      this.messages = items.map((m) => ({ role: m.role, text: m.text }));
+      this.render();
+    } catch {
+      /* 读历史失败不影响发消息 */
+    }
   }
 
   connect() {
@@ -422,16 +443,27 @@ class BridgeChatView extends ItemView {
     this.render();
   }
 
+  // Obsidian 自带渲染器；失败就退回纯文本，不能让一条消息把面板弄崩。
+  renderMarkdown(el, text) {
+    try {
+      MarkdownRenderer.render(this.app, String(text || ''), el, '', this);
+    } catch {
+      el.setText(String(text || ''));
+    }
+  }
+
   render() {
     if (!this.listEl) return;
     this.listEl.empty();
     for (const msg of this.messages) {
       const el = this.listEl.createDiv({ cls: `bridge-msg bridge-msg-${msg.role}` });
-      el.setText(msg.text);
+      // 助手回复按 Markdown 渲染（代码块、列表、粗体），用户自己的话保持纯文本
+      if (msg.role === 'assistant') this.renderMarkdown(el, msg.text);
+      else el.setText(msg.text);
     }
     if (this.assistantBuffer) {
       const el = this.listEl.createDiv({ cls: 'bridge-msg bridge-msg-assistant bridge-msg-streaming' });
-      el.setText(this.assistantBuffer);
+      this.renderMarkdown(el, this.assistantBuffer);
     }
     this.listEl.scrollTop = this.listEl.scrollHeight;
   }
@@ -910,6 +942,9 @@ function createConnectorClient(options = {}) {
     info: config,
     health: () => request('/health'),
     sessions: () => request('/sessions'),
+  // 读会话最近的消息：面板 reload 后靠它把消息恢复出来
+  transcript: (sessionId, limit = 20) =>
+    request(`/transcript?sessionId=${encodeURIComponent(sessionId)}&limit=${limit}`, { method: 'GET' }),
     createSession: (payload = {}) => request('/session', { method: 'POST', body: payload }),
     sendTask: (payload) => request('/task', { method: 'POST', body: payload }),
     inject: (payload) => request('/inject', { method: 'POST', body: payload }),
@@ -2425,6 +2460,7 @@ const DEFAULTS = {
   permissions: null,
   ledger: true,
   chatSessionId: '',
+  chatOpen: false,
   injectionEnabled: false,
   tokenTtl: 0,
   tokenIssuedAt: 0,
@@ -2446,6 +2482,7 @@ function normalizeSettings(raw) {
   const permissions = src.permissions && typeof src.permissions === 'object' ? src.permissions : null;
   const ledger = typeof src.ledger === 'boolean' ? src.ledger : DEFAULTS.ledger;
   const chatSessionId = typeof src.chatSessionId === 'string' ? src.chatSessionId : '';
+  const chatOpen = typeof src.chatOpen === 'boolean' ? src.chatOpen : false;
   const injectionEnabled = typeof src.injectionEnabled === 'boolean' ? src.injectionEnabled : false;
 
   return {
@@ -2457,6 +2494,7 @@ function normalizeSettings(raw) {
     permissions,
     ledger,
     chatSessionId,
+    chatOpen,
     injectionEnabled,
     tokenTtl,
     tokenIssuedAt,
@@ -2630,6 +2668,14 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
 
     this.addSettingTab(new BridgeSettingTab(this, this.app));
 
+    // 上次面板是开着的就自动恢复：改代码后 reload、或者重启 Obsidian，
+    // 侧栏那个视图会被一起收掉，不该让主人每次都手动点回来。
+    if (this.settings.chatOpen) {
+      this.app.workspace.onLayoutReady(() => {
+        this.activateChat();
+      });
+    }
+
     // token 轮换不是轮询：一次性算好下次该换的时刻，挂一个 setTimeout。
     // 提前一成换，常驻的 MCP 桥下一次读 info.json 就拿到新的。
     this.register(() => this.cancelTokenRotation());
@@ -2662,6 +2708,11 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
   }
 
   async activateChat() {
+    // 记下「面板是开着的」，reload / 重启后能自动恢复
+    if (!this.settings.chatOpen) {
+      this.settings.chatOpen = true;
+      this.persistSettings();
+    }
     const { workspace } = this.app;
     // 只留侧栏一个实例：主区域里的旧实例关掉，避免出现两套面板
     for (const leaf of workspace.getLeavesOfType(CHAT_VIEW_TYPE)) {

@@ -8,6 +8,7 @@ import path from 'node:path';
 import { createInjectionStore } from './injection.mjs';
 import { createTitleCache, createSessionFileIndex } from './session-title.mjs';
 import { createWorkspaceIndex } from './workspace-index.mjs';
+import { readRecentMessages } from './transcript.mjs';
 
 // DSH 的工作区注册表：分组要用它，否则会多出 DSH 界面里没有的「工作区」
 const WORKSPACE_STORE = path.join(os.homedir(), '.dsh', 'storages', 'workspace.json');
@@ -274,6 +275,20 @@ export function startConnector(options) {
       } catch (err) {
         json(res, 500, { ok: false, error: { code: 'create-failed', message: String(err?.message || err) } });
       }
+      return;
+    }
+
+    // 读会话里最近的对话：面板 reload 后靠它把消息恢复出来。
+    if (req.method === 'GET' && path === '/transcript') {
+      const sessionId = String(url.searchParams.get('sessionId') || '').trim();
+      if (!sessionId) {
+        json(res, 400, { ok: false, error: { code: 'bad-args', message: '缺少 sessionId' } });
+        return;
+      }
+      const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 20));
+      const file = sessionFileOf(sessionId);
+      const messages = file ? readRecentMessages(file, limit) : [];
+      json(res, 200, { ok: true, data: { sessionId, messages, hasFile: Boolean(file) } });
       return;
     }
 

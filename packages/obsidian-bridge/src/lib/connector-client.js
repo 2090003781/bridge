@@ -136,6 +136,9 @@ function createConnectorClient(options = {}) {
     info: config,
     health: () => request('/health'),
     sessions: () => request('/sessions'),
+  // 读会话最近的消息：面板 reload 后靠它把消息恢复出来
+  transcript: (sessionId, limit = 20) =>
+    request(`/transcript?sessionId=${encodeURIComponent(sessionId)}&limit=${limit}`, { method: 'GET' }),
     createSession: (payload = {}) => request('/session', { method: 'POST', body: payload }),
     sendTask: (payload) => request('/task', { method: 'POST', body: payload }),
     inject: (payload) => request('/inject', { method: 'POST', body: payload }),

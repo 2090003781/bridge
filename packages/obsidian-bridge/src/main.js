@@ -68,6 +68,14 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
 
     this.addSettingTab(new BridgeSettingTab(this, this.app));
 
+    // 上次面板是开着的就自动恢复：改代码后 reload、或者重启 Obsidian，
+    // 侧栏那个视图会被一起收掉，不该让主人每次都手动点回来。
+    if (this.settings.chatOpen) {
+      this.app.workspace.onLayoutReady(() => {
+        this.activateChat();
+      });
+    }
+
     // token 轮换不是轮询：一次性算好下次该换的时刻，挂一个 setTimeout。
     // 提前一成换，常驻的 MCP 桥下一次读 info.json 就拿到新的。
     this.register(() => this.cancelTokenRotation());
@@ -100,6 +108,11 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
   }
 
   async activateChat() {
+    // 记下「面板是开着的」，reload / 重启后能自动恢复
+    if (!this.settings.chatOpen) {
+      this.settings.chatOpen = true;
+      this.persistSettings();
+    }
     const { workspace } = this.app;
     // 只留侧栏一个实例：主区域里的旧实例关掉，避免出现两套面板
     for (const leaf of workspace.getLeavesOfType(CHAT_VIEW_TYPE)) {

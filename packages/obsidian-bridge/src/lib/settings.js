@@ -11,6 +11,7 @@ const DEFAULTS = {
   permissions: null,
   ledger: true,
   chatSessionId: '',
+  chatOpen: false,
   injectionEnabled: false,
   tokenTtl: 0,
   tokenIssuedAt: 0,
@@ -32,6 +33,7 @@ function normalizeSettings(raw) {
   const permissions = src.permissions && typeof src.permissions === 'object' ? src.permissions : null;
   const ledger = typeof src.ledger === 'boolean' ? src.ledger : DEFAULTS.ledger;
   const chatSessionId = typeof src.chatSessionId === 'string' ? src.chatSessionId : '';
+  const chatOpen = typeof src.chatOpen === 'boolean' ? src.chatOpen : false;
   const injectionEnabled = typeof src.injectionEnabled === 'boolean' ? src.injectionEnabled : false;
 
   return {
@@ -43,6 +45,7 @@ function normalizeSettings(raw) {
     permissions,
     ledger,
     chatSessionId,
+    chatOpen,
     injectionEnabled,
     tokenTtl,
     tokenIssuedAt,
