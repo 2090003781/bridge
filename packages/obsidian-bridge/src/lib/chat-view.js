@@ -24,6 +24,10 @@ class BridgeChatView extends ItemView {
     this.plugin = plugin;
     this.messages = [];
     this.assistantBuffer = '';
+    this.steerMode = false; // false = 排队等这一轮结束；true = 打断当前一轮
+    this.pending = [];      // 合并盒：连发的消息先攒在这里
+    this.pendingTimer = null;
+    this.mergeWindowMs = 1500; // 最后一次输入后等这么久再合并发出
     this.sessionId = null;
     this.ac = null;
     this.sideTimer = null;
@@ -60,6 +64,7 @@ class BridgeChatView extends ItemView {
   }
 
   onClose() {
+    if (this.pendingTimer) { clearTimeout(this.pendingTimer); this.pendingTimer = null; }
     // 用户主动关掉面板：下次启动别再自己弹出来
     this.plugin.settings.chatOpen = false;
     this.plugin.persistSettings();
@@ -157,6 +162,14 @@ class BridgeChatView extends ItemView {
     this.inputEl = inputWrap.createEl('textarea', {
       cls: 'bridge-chat-textarea',
       attr: { placeholder: '跟 DSH 说点什么…（Enter 发送，Shift+Enter 换行）', rows: '3' },
+    });
+    // queue = 排队等这一轮结束；steer = 立刻打断当前这一轮
+    this.steerBtn = inputWrap.createEl('button', { cls: 'bridge-chat-steer', text: '打断' });
+    this.steerBtn.title = '默认排队（等这一轮结束）。点亮「打断」则立刻插进当前这一轮。';
+    this.steerBtn.onClickEvent(() => {
+      this.steerMode = !this.steerMode;
+      this.steerBtn.toggleClass('is-on', this.steerMode);
+      new Notice(this.steerMode ? '发送模式：打断当前一轮' : '发送模式：排队等待');
     });
     this.sendBtn = inputWrap.createEl('button', { cls: 'bridge-chat-send', text: '发送' });
     this.sendBtn.onClickEvent(() => this.send());
@@ -288,11 +301,24 @@ class BridgeChatView extends ItemView {
       .subscribe(this.sessionId, (event) => this.onEvent(event), ac.signal)
       .catch((err) => {
         if (ac.signal.aborted) return;
-        this.setStatus('连接断开：' + String((err && err.message) || err));
+        // DSH 一重启，connector 进程重建，SSE 就断了。以前这里只是把状态改成
+        // 「连接断开」然后什么都不做——面板从此收不到任何回复。现在自动重连。
+        this.setStatus('连接断开，3 秒后重连…');
+        this.reconnectTimer = setTimeout(() => {
+          this.reconnectTimer = null;
+          if (this.ac === ac && !ac.signal.aborted && this.sessionId) {
+            this.setStatus('重连中…');
+            this.connect();
+          }
+        }, 3000);
       });
   }
 
   disconnect() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.ac) {
       try {
         this.ac.abort();
@@ -344,16 +370,45 @@ class BridgeChatView extends ItemView {
       new Notice('还没有绑定会话');
       return;
     }
-    this.messages.push({ role: 'user', text });
     this.inputEl.value = '';
+    // 打断模式：语义就是「立刻插进去」，不合并
+    if (this.steerMode) {
+      await this.deliver([text], true);
+      return;
+    }
+    // 排队模式：先进合并盒，最后一次输入后静默 1.5 秒才真发出去
+    this.pending.push(text);
+    if (this.pendingTimer) clearTimeout(this.pendingTimer);
+    this.pendingTimer = setTimeout(() => {
+      this.pendingTimer = null;
+      this.flushPending();
+    }, this.mergeWindowMs);
+    this.setStatus(`待发送（${this.pending.length} 条，停 ${Math.round(this.mergeWindowMs / 1000)} 秒后合并）…`);
+  }
+
+  // 把合并盒里的几条拼成一条发出去
+  async flushPending() {
+    if (!this.pending.length) return;
+    const parts = this.pending.slice();
+    this.pending = [];
+    await this.deliver(parts, false);
+  }
+
+  // 真正投递：parts 多于一条时合并成一段（中间空行分隔，保留原样）
+  async deliver(parts, isSteer) {
+    const text = parts.join('\n');
+    this.messages.push({ role: 'user', text });
     this.render();
-    this.setStatus('发送中…');
-    const res = await this.plugin.connector().sendTask({ message: text, sessionId: this.sessionId });
+    this.setStatus(isSteer ? '发送中…' : '排队中…');
+    const res = await this.plugin.connector().sendTask({
+      message: text,
+      sessionId: this.sessionId,
+      mode: isSteer ? 'steer' : 'queue',
+    });
     if (!res || res.ok !== true) {
       const raw = (res && res.error && res.error.message) || '发送失败';
       this.setStatus('发送失败');
       if (/resume failed|not found/i.test(raw)) {
-        // 典型情况：会话被删了，或者它当初用的 agent preset 已经不存在
         this.pushSystem(
           `这个会话已经用不了了：${raw.slice(0, 140)}\n` +
             '点上面「选择会话」换一个，或者「新建会话」。'

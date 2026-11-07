@@ -125,6 +125,12 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
       await leaf.setViewState({ type: CHAT_VIEW_TYPE, active: true });
     }
     workspace.revealLeaf(leaf);
+    // 面板可能是以前就加载过的（onOpen 那时连接可能正好失败），
+    // 每次打开顺手重连一次，保证 SSE 订阅是活的。
+    const view = leaf.view;
+    if (view && typeof view.connect === 'function' && view.sessionId) {
+      try { view.connect(); } catch { /* 重连失败会被状态栏接住 */ }
+    }
   }
 
   permissionsPath() {

@@ -151,3 +151,21 @@
 .bridge-injected-item { display: flex; align-items: center; gap: 6px; }
 .bridge-injected-name { flex: 1; font-size: 12px; color: var(--text-muted); }
 .bridge-injected-clearall { align-self: flex-start; font-size: 11px; padding: 2px 6px; }
+/* 发送模式切换：默认排队，点亮「打断」= steer（插进当前这一轮） */
+.bridge-chat-steer {
+  align-self: flex-end;
+  margin-right: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.bridge-chat-steer:hover { background: var(--background-modifier-hover); }
+.bridge-chat-steer.is-on {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: var(--interactive-accent);
+}
