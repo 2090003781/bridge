@@ -674,7 +674,11 @@ class SessionTreeModal extends Modal {
     const visible = this.sessions.filter((s) => !s.archived);
     const groups = new Map();
     for (const s of visible) {
-      const key = s.workspaceTitle || '(未分组)';
+      // workspaceTitle 是新连接器给的字段；旧连接器没有这个字段时
+      // 退回按 cwd 分组，免得升级顺序不同就全落进「未分组」。
+      const key =
+        s.workspaceTitle ||
+        (s.workspaceTitle === undefined ? tailPath(s.cwd, 2) : '(未分组)');
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(s);
     }

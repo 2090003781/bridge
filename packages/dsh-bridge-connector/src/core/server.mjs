@@ -3,7 +3,20 @@
 
 import http from 'node:http';
 import crypto from 'node:crypto';
+import os from 'node:os';
+import path from 'node:path';
 import { createInjectionStore } from './injection.mjs';
+import { createTitleCache, createSessionFileIndex } from './session-title.mjs';
+import { createWorkspaceIndex } from './workspace-index.mjs';
+
+// DSH 的工作区注册表：分组要用它，否则会多出 DSH 界面里没有的「工作区」
+const WORKSPACE_STORE = path.join(os.homedir(), '.dsh', 'storages', 'workspace.json');
+const workspaceOf = createWorkspaceIndex({ file: WORKSPACE_STORE });
+
+// 会话标题缓存与日志索引（全进程共用，避免每次列表都重扫）
+const titleCache = createTitleCache();
+const SESSIONS_ROOT = process.env.DSH_SESSIONS_DIR || path.join(os.homedir(), '.dsh', 'sessions');
+const sessionFileOf = createSessionFileIndex(SESSIONS_ROOT);
 
 const PROTOCOL = 'obsidian-bridge/1';
 // 单篇注入上限：注入进系统提示词、每轮都重发，所以必须有长度预算。
@@ -82,11 +95,38 @@ function readBody(req, limit = 1024 * 1024) {
   });
 }
 
-function publicSession(item) {
+// 客户端列表要显示「人话」：工作区 + 会话标题。
+// 标题来自 DSH 的 title 投影（首条人类消息前几个词，或 LLM 生成），
+// 投影里没有就返回 null，让前端自己降级成「目录名 · 时间」。
+function pickTitle(item, fileOf) {
+  // 1) 投影里有没有（DSH 若将来填了就直接用，最快）
+  const values = item && item.projections && item.projections.values;
+  if (values && typeof values === 'object') {
+    for (const key of ['title', 'sessionTitle', 'displayTitle']) {
+      if (typeof values[key] === 'string' && values[key].trim()) return values[key].trim();
+    }
+  }
+  // 2) 投影里没有（实测 295 个会话全是空），去 session 日志里读 session/title 事件
+  if (typeof fileOf === 'function') {
+    const file = fileOf(item && item.sessionId);
+    if (file) return titleCache.get(item.sessionId, file);
+  }
+  return null;
+}
+
+function publicSession(item, fileOf) {
+  const ws = workspaceOf(item && item.sessionId);
   return {
     sessionId: item.sessionId,
     cwd: item.cwd ?? null,
     running: item.running === true,
+    blank: item.blank === true,
+    parentSessionId: item.parentSessionId ?? null,
+    title: pickTitle(item, fileOf),
+    // 分组依据：DSH 注册表里的工作区名；没注册的归「未分组」
+    workspaceTitle: ws.workspace ? ws.workspace.title : null,
+    workspacePath: ws.workspace ? ws.workspace.path : null,
+    archived: ws.archived,
     updatedAt: Number.isFinite(item.updatedAt) ? new Date(item.updatedAt).toISOString() : null,
   };
 }
@@ -202,7 +242,13 @@ export function startConnector(options) {
       try {
         const value = await sessions.list({}, new AbortController().signal);
         const items = Array.isArray(value?.items) ? value.items : [];
-        const sorted = items.map(publicSession).sort((a, b) => Date.parse(b.updatedAt || 0) - Date.parse(a.updatedAt || 0));
+        // 标题要解压日志读，几百个会话全读会卡住首屏；
+      // 所以只给最近活跃的 60 个读标题，剩下的前端降级成「目录 · 时间 · 短 id」。
+      const byRecent = [...items].sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0));
+      const TITLE_LIMIT = 60;
+      const sorted = byRecent.map((item, idx) =>
+        publicSession(item, idx < TITLE_LIMIT ? sessionFileOf : null)
+      );
         json(res, 200, { ok: true, data: { total: sorted.length, sessions: sorted } });
       } catch (err) {
         json(res, 500, { ok: false, error: { code: 'list-failed', message: String(err?.message || err) } });

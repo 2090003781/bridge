@@ -431,3 +431,43 @@ test('/inject 候选会话没有 sessionId 时回 409，不 500', async (t) => {
 
   assert.equal(res.status, 409);
 });
+
+
+// ── /sessions 要给 Obsidian 侧够用的信息（工作区 + 人类可读的会话名）────────
+test('/sessions 带工作区与标题字段，供树形选择用', async (t) => {
+  const sessions = fakeSessions([
+    {
+      sessionId: 'session-aaa',
+      cwd: 'D:\\RAG',
+      updatedAt: 5000,
+      running: false,
+      blank: false,
+      projections: { asOfSeq: 3, values: { title: '整理知识库索引' } },
+    },
+    {
+      sessionId: 'session-bbb',
+      cwd: 'D:\\个人数据\\辞玖',
+      updatedAt: 4000,
+      running: true,
+      blank: false,
+      projections: { asOfSeq: 1, values: {} },
+    },
+  ]);
+  const ctx = await boot(sessions);
+  t.after(() => ctx.server.close());
+
+  const body = await (await fetch(`${ctx.base}/sessions`, {
+    headers: { 'x-bridge-token': ctx.token },
+  })).json();
+
+  const items = body.data.sessions;
+  assert.equal(items.length, 2);
+
+  const a = items.find((x) => x.sessionId === 'session-aaa');
+  assert.equal(a.cwd, 'D:\\RAG', '要带工作区');
+  assert.equal(a.title, '整理知识库索引', '投影里有标题就读出来');
+
+  const b = items.find((x) => x.sessionId === 'session-bbb');
+  assert.equal(b.title, null, '没有标题就给 null，让前端自己降级');
+  assert.equal(b.running, true);
+});
