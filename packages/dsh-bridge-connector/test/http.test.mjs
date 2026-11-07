@@ -65,7 +65,8 @@ test('POST /task 默认投给最近活跃的会话', async (t) => {
   assert.equal(body.data.sessionId, 'recent');
   const promptCall = sessions.calls.find((c) => c[0] === 'prompt')[1];
   assert.equal(promptCall.sessionId, 'recent');
-  assert.deepEqual(promptCall.content, [{ type: 'text', text: '把这段改一下' }]);
+  // 投递时统一加来源标记，所以这里期望带前缀
+  assert.deepEqual(promptCall.content, [{ type: 'text', text: '【Obsidian】把这段改一下' }]);
   assert.equal(promptCall.mode, 'queue');
 });
 
@@ -470,4 +471,37 @@ test('/sessions 带工作区与标题字段，供树形选择用', async (t) => 
   const b = items.find((x) => x.sessionId === 'session-bbb');
   assert.equal(b.title, null, '没有标题就给 null，让前端自己降级');
   assert.equal(b.running, true);
+});
+
+
+// ── 来源标记：从面板发来的消息要能认出来 ────────────────────────────────
+test('/task 投递时给消息加 Obsidian 来源标记', async (t) => {
+  const sessions = fakeSessions([{ sessionId: 's1', updatedAt: 1 }]);
+  const ctx = await boot(sessions);
+  t.after(() => ctx.server.close());
+
+  const res = await fetch(`${ctx.base}/task`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-bridge-token': ctx.token },
+    body: JSON.stringify({ message: '帮我看下这条', sessionId: 's1' }),
+  });
+  assert.equal(res.status, 200);
+
+  const call = sessions.calls.find((c) => c[0] === 'prompt');
+  assert.ok(call, '应当调用过 prompt');
+  assert.equal(call[1].content[0].text, '【Obsidian】帮我看下这条');
+});
+
+test('已经带标记的消息不重复加', async (t) => {
+  const sessions = fakeSessions([{ sessionId: 's1', updatedAt: 1 }]);
+  const ctx = await boot(sessions);
+  t.after(() => ctx.server.close());
+
+  await fetch(`${ctx.base}/task`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-bridge-token': ctx.token },
+    body: JSON.stringify({ message: '【Obsidian】已经带过了', sessionId: 's1' }),
+  });
+  const call = sessions.calls.find((c) => c[0] === 'prompt');
+  assert.equal(call[1].content[0].text, '【Obsidian】已经带过了');
 });

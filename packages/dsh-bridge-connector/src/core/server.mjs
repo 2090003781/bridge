@@ -98,6 +98,15 @@ function readBody(req, limit = 1024 * 1024) {
 // 客户端列表要显示「人话」：工作区 + 会话标题。
 // 标题来自 DSH 的 title 投影（首条人类消息前几个词，或 LLM 生成），
 // 投影里没有就返回 null，让前端自己降级成「目录名 · 时间」。
+// 从 Obsidian 面板投递的消息打个来源标记。
+// 不标的话，它在会话历史里跟 Web 上打的字一模一样，模型分不清该用哪种口径回
+// （面板窄，适合短回复）。标记是真写进正文的，不是透明元数据——DSH 的 prompt 没有 source 字段。
+const OBSIDIAN_TAG = '【Obsidian】';
+function markSource(text) {
+  const s = String(text || '');
+  return s.startsWith(OBSIDIAN_TAG) ? s : OBSIDIAN_TAG + s;
+}
+
 function pickTitle(item, fileOf) {
   // 1) 投影里有没有（DSH 若将来填了就直接用，最快）
   const values = item && item.projections && item.projections.values;
@@ -385,7 +394,7 @@ export function startConnector(options) {
             requestId,
             sessionId,
             mode: payload.mode === 'steer' ? 'steer' : 'queue',
-            content: [{ type: 'text', text: message }],
+            content: [{ type: 'text', text: markSource(message) }],
             ...(clientTimeZone ? { clientTimeZone } : {}),
           },
           new AbortController().signal,

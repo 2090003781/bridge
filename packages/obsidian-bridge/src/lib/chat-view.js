@@ -181,10 +181,31 @@ class BridgeChatView extends ItemView {
 
     const previous = this.plugin.settings.chatSessionId || '';
     if (previous) {
-      this.bindSession(previous);
+      // 复用之前先确认它还活着：DSH 那边会删会话、清理归档，
+      // 存着的 id 可能是死的，直接绑定会在第一次发送时才炸（resume failed）。
+      const alive = await this.sessionExists(previous);
+      if (alive) {
+        this.bindSession(previous);
+        return;
+      }
+      this.plugin.settings.chatSessionId = '';
+      await this.plugin.saveSettings();
+      this.pushSystem(
+        `上次的会话已经不存在了（${previous.slice(0, 12)}…）。` +
+          '点上面「选择会话」挑一个，或者「新建会话」。'
+      );
+      this.setStatus('未绑定会话');
       return;
     }
     await this.createAndBind();
+  }
+
+  // 会话还在不在？读不到列表时不乱判（返回 true，让真正的发送去报错）
+  async sessionExists(sessionId) {
+    const res = await this.plugin.connector().sessions();
+    if (!res || res.ok !== true) return true;
+    const items = (res.data && res.data.sessions) || [];
+    return items.some((s) => s && s.sessionId === sessionId);
   }
 
   bindSession(sessionId) {
@@ -308,9 +329,17 @@ class BridgeChatView extends ItemView {
     this.setStatus('发送中…');
     const res = await this.plugin.connector().sendTask({ message: text, sessionId: this.sessionId });
     if (!res || res.ok !== true) {
-      const msg = (res && res.error && res.error.message) || '发送失败';
+      const raw = (res && res.error && res.error.message) || '发送失败';
       this.setStatus('发送失败');
-      this.pushSystem(msg);
+      if (/resume failed|not found/i.test(raw)) {
+        // 典型情况：会话被删了，或者它当初用的 agent preset 已经不存在
+        this.pushSystem(
+          `这个会话已经用不了了：${raw.slice(0, 140)}\n` +
+            '点上面「选择会话」换一个，或者「新建会话」。'
+        );
+      } else {
+        this.pushSystem(raw);
+      }
     }
   }
 
