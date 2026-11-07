@@ -100,6 +100,7 @@ class BridgeChatView extends ItemView {
     };
     addBtn('注入', () => this.openInjectionPanel());
     addBtn('复制 token', () => this.plugin.copyToken());
+    addBtn('选择会话', () => this.openSessionPicker());
     addBtn('新建会话', () => this.createAndBind());
     addBtn('操作记录', () => this.plugin.openLog());
   }
@@ -195,6 +196,29 @@ class BridgeChatView extends ItemView {
     this.setStatus('已连接');
     this.refreshLocalState();
     this.connect();
+  }
+
+  // 拉会话列表 → 弹树（工作区 → 会话），选中就绑定
+  async openSessionPicker() {
+    const client = this.plugin.connector();
+    if (!client.info()) {
+      this.pushSystem('连接器未就绪，读不到会话列表。');
+      return;
+    }
+    const res = await client.sessions();
+    if (!res || res.ok !== true) {
+      this.pushSystem('读会话列表失败：' + ((res && res.error && res.error.message) || '未知原因'));
+      return;
+    }
+    const items = (res.data && res.data.sessions) || [];
+    if (!items.length) {
+      this.pushSystem('DSH 那边还没有会话。');
+      return;
+    }
+    new SessionTreeModal(this.app, items, this.sessionId, (sessionId) => {
+      this.bindSession(sessionId);
+      new Notice('已切换会话');
+    }).open();
   }
 
   async createAndBind() {
@@ -602,4 +626,101 @@ class NoteTreePickerModal extends Modal {
   }
 }
 
-module.exports = { BridgeChatView, VIEW_TYPE, NoteTreePickerModal, InjectionPanelModal };
+// ── 会话选择树（工作区 → 会话）────────────────────────────
+
+function tailPath(p, n = 1) {
+  const parts = String(p || '').replace(/[\\/]+$/, '').split(/[\\/]+/).filter(Boolean);
+  return parts.slice(-n).join('\\') || '(无工作区)';
+}
+
+// 会话名优先用 DSH 的标题；没有就降级成「目录 · 时间 · 短 id」——总比一串 uuid 强。
+function sessionLabel(s) {
+  if (s && s.title) return s.title;
+  const when = s && s.updatedAt ? new Date(s.updatedAt) : null;
+  const stamp = when && !Number.isNaN(when.getTime())
+    ? `${String(when.getMonth() + 1).padStart(2, '0')}-${String(when.getDate()).padStart(2, '0')} ` +
+      `${String(when.getHours()).padStart(2, '0')}:${String(when.getMinutes()).padStart(2, '0')}`
+    : '';
+  return [tailPath(s && s.cwd, 1), stamp, String((s && s.sessionId) || '').slice(-6)].filter(Boolean).join(' · ');
+}
+
+class SessionTreeModal extends Modal {
+  constructor(app, sessions, currentId, onPick) {
+    super(app);
+    this.sessions = sessions || [];
+    this.currentId = currentId || null;
+    this.onPick = onPick;
+    this.expanded = new Set();
+  }
+
+  onOpen() {
+    this.modalEl.addClass('bridge-tree-modal');
+    // 默认全部收起：某个工作区可能有几十个会话，一展开就把其他工作区
+    // 全挤到滚动区下面，看起来像「只有几个工作区」。要点哪个再展开哪个。
+    this.render();
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+
+  render() {
+    const c = this.contentEl;
+    c.empty();
+    c.createEl('h3', { text: '选择 DSH 会话' });
+    // 分组依据是 DSH 的工作区注册表（不是会话的 cwd）：
+    // 按 cwd 分会多出 DSH 界面里根本没有的「工作区」，两边对不上。
+    // 归档会话在 DSH 里也不显示，这里一并过滤。
+    const visible = this.sessions.filter((s) => !s.archived);
+    const groups = new Map();
+    for (const s of visible) {
+      const key = s.workspaceTitle || '(未分组)';
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(s);
+    }
+    const archivedCount = this.sessions.length - visible.length;
+    c.createDiv({
+      cls: 'setting-item-description',
+      text:
+        `共 ${groups.size} 个工作区 · ${visible.length} 个会话` +
+        (archivedCount ? `（已隐藏 ${archivedCount} 个归档）` : '') +
+        '。点工作区展开，点会话切换。',
+    });
+    const latestOf = (list) => Math.max(0, ...list.map((x) => Date.parse(x.updatedAt) || 0));
+    const ordered = [...groups.entries()].sort((a, b) => latestOf(b[1]) - latestOf(a[1]));
+
+    const tree = c.createDiv({ cls: 'bridge-tree' });
+    for (const [cwd, list] of ordered) {
+      const rows = [...list].sort((a, b) => (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0));
+      const open = this.expanded.has(cwd);
+      const head = tree.createDiv({ cls: 'bridge-tree-row bridge-tree-folder' });
+      head.createSpan({ cls: 'bridge-tree-arrow', text: open ? '▾' : '▸' });
+      const hasCurrent = rows.some((s) => s.sessionId === this.currentId);
+      head.createSpan({ cls: 'bridge-tree-name', text: `${cwd}（${rows.length}）${hasCurrent ? ' · 当前' : ''}` });
+      head.onClickEvent(() => {
+        if (this.expanded.has(cwd)) this.expanded.delete(cwd);
+        else this.expanded.add(cwd);
+        this.render();
+      });
+      if (!open) continue;
+      for (const s of rows) {
+        const active = s.sessionId === this.currentId;
+        const row = tree.createDiv({
+          cls: 'bridge-tree-row bridge-tree-file' + (active ? ' is-selected' : ''),
+        });
+        row.style.paddingLeft = '16px';
+        row.createSpan({ cls: 'bridge-tree-name', text: (active ? '● ' : '') + sessionLabel(s) });
+        row.onClickEvent(() => {
+          this.close();
+          try {
+            this.onPick(s.sessionId);
+          } catch {
+            /* 回调异常不外抛 */
+          }
+        });
+      }
+    }
+  }
+}
+
+module.exports = { BridgeChatView, VIEW_TYPE, NoteTreePickerModal, InjectionPanelModal, SessionTreeModal };
