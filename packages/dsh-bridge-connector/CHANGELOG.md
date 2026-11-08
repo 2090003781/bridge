@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0 — 2026-11-08
+
+**新端点**
+- `GET /workspaces` — 读 DSH 的工作区列表
+- `POST /workspace {path,title}` — 注册一个目录为工作区
+- `GET /transcript?sessionId=&limit=` — 读会话最近的对话（面板 reload 后靠它恢复）
+
+**改动**
+- `/sessions` 增加 `title`（从 session 日志的 `session/title` 事件读，投影里是空的）、`workspaceTitle`、`workspacePath`、`archived`、`blank`、`parentSessionId`
+- `/task` 投递时给消息加 `【Obsidian】` 来源标记；支持 `mode: steer`
+- `/session` 支持 `workspaceId`；`workspaceId` 与 `cwd` 二选一（同时传 DSH 会拒）
+- 只给最近 60 个会话读标题，其余降级（标题要解压日志，几百个全读会卡首屏）
+
 ## 0.3.0 — 2026-11-02
 
 **注入改成实时跟随（行为变更）**

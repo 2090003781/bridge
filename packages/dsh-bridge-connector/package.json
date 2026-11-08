@@ -1,6 +1,6 @@
 {
   "name": "dsh-bridge-connector",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Loopback bridge that lets an Obsidian plugin drive DSH sessions and inject vault notes into the system prompt.",
   "type": "module",
   "main": "./src/index.js",
