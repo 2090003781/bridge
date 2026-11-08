@@ -23,13 +23,21 @@ export function createWorkspaceIndex({ file, ttlMs = 60 * 1000 } = {}) {
     if (!data || !data.unit || data.unit.name !== 'workspace') return empty;
 
     const table = data.tables && data.tables.workspaces;
-    const rows = Array.isArray(table) ? table : table ? Object.values(table) : [];
+    // 表是「对象」：键就是 workspaceId，记录里反而不带 id
+    const entries = Array.isArray(table)
+      ? table.map((w, i) => {
+          const id = (w && (w.id || w.workspaceId)) || i;
+          return [String(id), w];
+        })
+      : table
+        ? Object.entries(table)
+        : [];
     const bySession = new Map();
     const workspaces = [];
-    for (const w of rows) {
+    for (const [id, w] of entries) {
       if (!w || typeof w !== 'object') continue;
       const title = typeof w.title === 'string' && w.title.trim() ? w.title.trim() : String(w.path || '');
-      const item = { title, path: typeof w.path === 'string' ? w.path : '' };
+      const item = { workspaceId: String(id), title, path: typeof w.path === 'string' ? w.path : '' };
       workspaces.push(item);
       for (const sid of Array.isArray(w.sessionIds) ? w.sessionIds : []) {
         bySession.set(String(sid), item);

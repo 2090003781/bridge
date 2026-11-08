@@ -24,8 +24,8 @@ test('按注册表把会话映射到工作区', () => {
     { workspaceId: 'w2', path: 'D:\\AI', title: 'AI', sessionIds: ['s3'] },
   ]);
   const lookup = createWorkspaceIndex({ file });
-  assert.deepEqual(lookup('s1').workspace, { title: 'RAG', path: 'D:\\RAG' });
-  assert.deepEqual(lookup('s3').workspace, { title: 'AI', path: 'D:\\AI' });
+  assert.deepEqual(lookup('s1').workspace, { workspaceId: 'w1', title: 'RAG', path: 'D:\\RAG' });
+  assert.deepEqual(lookup('s3').workspace, { workspaceId: 'w2', title: 'AI', path: 'D:\\AI' });
   assert.equal(lookup('nope').workspace, null, '没注册的会话归未分组');
 });
 

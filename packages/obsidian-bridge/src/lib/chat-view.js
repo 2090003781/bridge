@@ -260,7 +260,9 @@ class BridgeChatView extends ItemView {
     new SessionTreeModal(this.app, items, this.sessionId, (sessionId) => {
       this.bindSession(sessionId);
       new Notice('已切换会话');
-    }).open();
+      }, (workspaceId) => {
+        this.createAndBind(workspaceId);
+      }).open();
   }
 
   // 确保当前库目录在 DSH 里是一个工作区：没有就注册一个（标题用库名）。
@@ -284,14 +286,15 @@ class BridgeChatView extends ItemView {
     }
   }
 
-  async createAndBind() {
+  async createAndBind(targetWorkspaceId = null) {
     const client = this.plugin.connector();
     if (!client.info()) {
       this.pushSystem('连接器未就绪，无法新建会话。');
       return;
     }
     const base = this.app.vault.adapter.getBasePath();
-    const workspaceId = await this.ensureWorkspace();
+    // 指定了工作区就用它；否则落到 Obsidian 自己的工作区（库目录）
+    const workspaceId = targetWorkspaceId || (await this.ensureWorkspace());
     // workspaceId 和 cwd 只能二选一（DSH 会直接拒），工作区自带路径
     const created = await client.createSession(
       workspaceId ? { workspaceId } : base ? { cwd: base } : {}
@@ -790,11 +793,12 @@ function sessionLabel(s) {
 }
 
 class SessionTreeModal extends Modal {
-  constructor(app, sessions, currentId, onPick) {
+  constructor(app, sessions, currentId, onPick, onNew) {
     super(app);
     this.sessions = sessions || [];
     this.currentId = currentId || null;
     this.onPick = onPick;
+    this.onNew = onNew || (() => {});
     this.expanded = new Set();
   }
 
@@ -867,6 +871,15 @@ class SessionTreeModal extends Modal {
             /* 回调异常不外抛 */
           }
         });
+      // 这个工作区下也可以直接新建（不用回面板点「新建会话」）
+      const wsId = rows.find((x) => x.workspaceId)?.workspaceId || null;
+      const addRow = tree.createDiv({ cls: 'bridge-tree-row bridge-tree-new' });
+      addRow.style.paddingLeft = '20px';
+      addRow.createSpan({ cls: 'bridge-tree-name', text: '＋ 在此工作区新建会话' });
+      addRow.onClickEvent(() => {
+        this.close();
+        try { this.onNew(wsId); } catch { /* ignore */ }
+      });
       }
     }
   }

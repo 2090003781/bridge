@@ -134,6 +134,7 @@ function publicSession(item, fileOf) {
     parentSessionId: item.parentSessionId ?? null,
     title: pickTitle(item, fileOf),
     // 分组依据：DSH 注册表里的工作区名；没注册的归「未分组」
+    workspaceId: ws.workspace ? ws.workspace.workspaceId : null,
     workspaceTitle: ws.workspace ? ws.workspace.title : null,
     workspacePath: ws.workspace ? ws.workspace.path : null,
     archived: ws.archived,

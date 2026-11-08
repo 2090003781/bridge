@@ -169,3 +169,7 @@
   color: var(--text-on-accent);
   border-color: var(--interactive-accent);
 }
+
+/* 工作区下「新建会话」那行：跟会话条目区分开 */
+.bridge-tree-new .bridge-tree-name { color: var(--text-accent); }
+.bridge-tree-new:hover { background: var(--background-modifier-hover); }
