@@ -66,7 +66,11 @@ test('POST /task 默认投给最近活跃的会话', async (t) => {
   const promptCall = sessions.calls.find((c) => c[0] === 'prompt')[1];
   assert.equal(promptCall.sessionId, 'recent');
   // 投递时统一加来源标记，所以这里期望带前缀
-  assert.deepEqual(promptCall.content, [{ type: 'text', text: '【Obsidian】把这段改一下' }]);
+  // 消息前面可能还挂着当前笔记的坐标，所以只校验「来源标记 + 原文结尾」和「标记只加一次」
+  assert.equal(promptCall.content.length, 1);
+  assert.equal(promptCall.content[0].type, 'text');
+  assert.match(promptCall.content[0].text, /【Obsidian】把这段改一下$/);
+  assert.equal(promptCall.content[0].text.split('【Obsidian】').length - 1, 1, '来源标记只该有一次');
   assert.equal(promptCall.mode, 'queue');
 });
 
@@ -489,7 +493,7 @@ test('/task 投递时给消息加 Obsidian 来源标记', async (t) => {
 
   const call = sessions.calls.find((c) => c[0] === 'prompt');
   assert.ok(call, '应当调用过 prompt');
-  assert.equal(call[1].content[0].text, '【Obsidian】帮我看下这条');
+  assert.match(call[1].content[0].text, /【Obsidian】帮我看下这条$/);
 });
 
 test('已经带标记的消息不重复加', async (t) => {
@@ -503,5 +507,7 @@ test('已经带标记的消息不重复加', async (t) => {
     body: JSON.stringify({ message: '【Obsidian】已经带过了', sessionId: 's1' }),
   });
   const call = sessions.calls.find((c) => c[0] === 'prompt');
-  assert.equal(call[1].content[0].text, '【Obsidian】已经带过了');
+  assert.match(call[1].content[0].text, /【Obsidian】已经带过了$/);
+  // 关键：前缀只加一次，不许叠成 【Obsidian】【Obsidian】…
+  assert.equal(call[1].content[0].text.split('【Obsidian】').length - 1, 1);
 });

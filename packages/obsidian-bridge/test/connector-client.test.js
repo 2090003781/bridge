@@ -146,3 +146,49 @@ test('injectStatus / clearInjection 走 /inject', async () => {
   assert.equal(t.calls[1].url, 'http://127.0.0.1:8812/inject/clear');
   assert.equal(t.calls[1].method, 'POST');
 });
+
+
+test('pushActiveNote 把当前笔记推到 /active-note', async () => {
+  const t = fakeTransport(() => ({ status: 200, text: '{"ok":true,"data":{"path":"a.md","length":2}}' }));
+  const client = createConnectorClient({
+    loadInfo: () => ({ host: '127.0.0.1', port: 8812, token: 'tk' }),
+    requestImpl: t.requestImpl,
+  });
+
+  const res = await client.pushActiveNote({ path: 'a.md', title: 'A', content: '正文' });
+
+  assert.equal(res.ok, true);
+  assert.equal(t.calls[0].method, 'POST');
+  assert.equal(t.calls[0].url, 'http://127.0.0.1:8812/active-note');
+  const body = JSON.parse(t.calls[0].body);
+  assert.equal(body.path, 'a.md');
+  assert.equal(body.title, 'A');
+  assert.equal(body.content, '正文');
+});
+
+test('clearActiveNote 发 path:null —— 明确表示「现在没有打开的笔记」', async () => {
+  const t = fakeTransport(() => ({ status: 200, text: '{"ok":true,"data":{"cleared":true}}' }));
+  const client = createConnectorClient({
+    loadInfo: () => ({ host: '127.0.0.1', port: 8812, token: 'tk' }),
+    requestImpl: t.requestImpl,
+  });
+
+  await client.clearActiveNote();
+
+  assert.equal(t.calls[0].url, 'http://127.0.0.1:8812/active-note');
+  const body = JSON.parse(t.calls[0].body);
+  assert.equal(body.path, null);
+});
+
+test('activeNote 用 GET 查询当前状态', async () => {
+  const t = fakeTransport(() => ({ status: 200, text: '{"ok":true,"data":null}' }));
+  const client = createConnectorClient({
+    loadInfo: () => ({ host: '127.0.0.1', port: 8812, token: 'tk' }),
+    requestImpl: t.requestImpl,
+  });
+
+  await client.activeNote();
+
+  assert.equal(t.calls[0].method, 'GET');
+  assert.equal(t.calls[0].url, 'http://127.0.0.1:8812/active-note');
+});

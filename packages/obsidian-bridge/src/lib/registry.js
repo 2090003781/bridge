@@ -18,6 +18,26 @@ function activeEditor(obsidian) {
   return { view, editor: view.editor, file: view.file || null };
 }
 
+// 「屏幕上那一篇」不一定有焦点：在主面板里打字时，焦点在输入框上，
+// activeLeaf 就是面板本身，而不是笔记。这时候要找还开着的 Markdown 视图——
+// 主人刚从那一篇切过来，它才是他在看的东西，光标是他离开时停的地方。
+// 写操作仍然只认 activeEditor：没有焦点就不该替他改。
+function screenEditor(obsidian) {
+  const ws = obsidian && obsidian.workspace;
+  if (!ws) return null;
+  const active = activeEditor(obsidian);
+  if (active && active.file) return { ...active, focused: true };
+  const leaves = typeof ws.getLeavesOfType === 'function' ? ws.getLeavesOfType('markdown') : [];
+  for (let i = leaves.length - 1; i >= 0; i -= 1) {
+    const leaf = leaves[i];
+    const view = leaf && leaf.view;
+    if (view && view.editor && view.file) {
+      return { view, editor: view.editor, file: view.file, focused: false };
+    }
+  }
+  return null;
+}
+
 function requireEditor(ctx) {
   const active = activeEditor(ctx.obsidian);
   if (!active) throw opError('no-active-editor', '没有打开的 Markdown 编辑器（先在 Obsidian 里打开一篇笔记）');
@@ -79,10 +99,10 @@ const OPS = [
   {
     id: 'obsidian.editor.state',
     tier: 'read',
-    summary: '当前活跃编辑器的状态：路径 / 光标 / 选区 / 行数',
+    summary: '屏幕上那篇笔记：路径 / 光标最后位置 / 选区 / 行数（焦点不在编辑器里也照样算）',
     run(ctx) {
-      const active = activeEditor(ctx.obsidian);
-      if (!active) return { available: false, reason: 'no-active-editor' };
+      const active = screenEditor(ctx.obsidian);
+      if (!active) return { available: false, reason: 'no-open-note' };
       const ed = active.editor;
       const cursor = typeof ed.getCursor === 'function' ? ed.getCursor() : null;
       const selected = typeof ed.getSelection === 'function' ? ed.getSelection() : '';
@@ -99,6 +119,9 @@ const OPS = [
         available: true,
         path: active.file ? active.file.path : null,
         mode: active.view.getMode ? active.view.getMode() : null,
+        // focused=false：这不是焦点所在的编辑器（比如焦点在 Bridge 面板输入框里），
+        // 光标是主人最后一次停在那里的位置，仍然说明他在看哪一段。
+        focused: active.focused !== false,
         cursor,
         selection: selected
           ? { text: selected.length > 2000 ? `${selected.slice(0, 2000)}…` : selected, length: selected.length, from, to }

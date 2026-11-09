@@ -9,6 +9,8 @@ import { createInjectionStore } from './injection.mjs';
 import { createTitleCache, createSessionFileIndex } from './session-title.mjs';
 import { createWorkspaceIndex } from './workspace-index.mjs';
 import { readRecentMessages } from './transcript.mjs';
+import { renderActiveNote, renderCursorLine } from './active-note.mjs';
+import { createObsidianProbe, mergeActiveNote } from './obsidian-probe.mjs';
 
 // DSH 的工作区注册表：分组要用它，否则会多出 DSH 界面里没有的「工作区」
 const WORKSPACE_STORE = path.join(os.homedir(), '.dsh', 'storages', 'workspace.json');
@@ -156,9 +158,106 @@ export function startConnector(options) {
     injectionFile = null,
     workspaceRegistry = null,
     injectionState = { on: false },
+    obsidianProbe = null,
   } = options;
 
+  // 投递前现查 Obsidian 的光标：本地回环一次几毫秒，比等推送精确。
+  const probe = obsidianProbe || createObsidianProbe();
+
   const injectionStore = injections || createInjectionStore({ ttlMs: injectionTtlMs, file: injectionFile });
+
+  // 当前打开的笔记：Obsidian 侧在切标签、改正文时推上来，
+  // 目的是让 agent 不用等主人开口就知道「屏幕上这篇」是什么。
+  // 只放内存：这是「此刻正在看什么」，DSH 重启后应当重新推一次；
+  // 落盘只会让过期的一篇冒充当前，比没有更糟。
+  const ACTIVE_NOTE_TTL_MS = 10 * 60 * 1000;
+  let activeNote = null;
+  const asNum = (v) => (v === null || v === undefined || v === '' ? null : Number.isFinite(Number(v)) ? Number(v) : null);
+  const asText = (v, limit) => (typeof v === 'string' && v ? v.slice(0, limit) : null);
+
+  /** 把客户端推来的笔记元信息收成固定形状：多出来的丢掉，缺的不编。 */
+  function normalizeActiveNote(payload) {
+    const pos = (p) =>
+      p && Number.isFinite(Number(p.line)) ? { line: asNum(p.line), ch: asNum(p.ch) } : null;
+    const sel = payload.selection;
+    const selection =
+      sel && Number.isFinite(Number(sel.fromLine)) && Number.isFinite(Number(sel.toLine))
+        ? {
+            fromLine: asNum(sel.fromLine),
+            fromCh: asNum(sel.fromCh),
+            toLine: asNum(sel.toLine),
+            toCh: asNum(sel.toCh),
+            chars: asNum(sel.chars),
+            preview: asText(sel.preview, 400),
+          }
+        : null;
+    return {
+      path: String(payload.path).slice(0, 400),
+      absPath: asText(payload.absPath, 800),
+      title: asText(payload.title, 200),
+      charCount: asNum(payload.charCount),
+      lineCount: asNum(payload.lineCount),
+      updatedAt: asText(payload.updatedAt, 40),
+      cursor: pos(payload.cursor),
+      selection,
+      // 客户端明确说过「没有选区」才记为 true；没说过就当不知道
+      checked: payload.checked === true,
+      heading: asText(payload.heading, 200),
+      // 焦点在不在编辑器里：客户端说 false 才算 false，没说过就当在（旧客户端不发这个）
+      focused: payload.focused === false ? false : true,
+      // 另外还开着哪几篇：只留路径字符串，最多 8 条
+      others: Array.isArray(payload.others)
+        ? payload.others.filter((x) => typeof x === 'string' && x).slice(0, 8)
+        : [],
+      // 临时标记：0 个不说，1 个是点，2 个是范围
+      marks: Array.isArray(payload.marks)
+        ? payload.marks
+            .filter((x) => x && asNum(x.line) !== null)
+            .slice(0, 2)
+            .map((x) => ({ line: asNum(x.line), ch: asNum(x.ch) || 0 }))
+        : [],
+      at: Date.now(),
+    };
+  }
+
+  function activeNoteOf() {
+    if (!activeNote) return null;
+    if (Date.now() - activeNote.at > ACTIVE_NOTE_TTL_MS) return null;
+    return activeNote;
+  }
+
+  // 同一会话里，同一篇笔记的坐标只搭一次车：
+  // 每轮都重复灌一遍没有任何新信息，只会把真正要说的话挤走。
+  const noteSeen = new Map(); // sessionId -> Set<path>
+
+  /** 此刻的当前笔记：现查优先，问不到就用推送缓存。任何异常都不许影响投递。 */
+  async function currentNote() {
+    try {
+      const live = await probe.editorState();
+      if (live.ok) {
+        // 它明确说「没有打开的笔记」时，信它，不要用旧缓存把旧的一篇顶上来。
+        if (live.data === null) return null;
+        return mergeActiveNote(live.data, activeNoteOf());
+      }
+    } catch {
+      /* 探测失败不打断投递 */
+    }
+    return activeNoteOf();
+  }
+
+  /** 这一轮要顺带告诉模型的「当前笔记」整篇坐标；这一篇已经给过就返回空串。 */
+  function takeActiveNoteFor(sessionId, note) {
+    const live = note;
+    if (!live || !live.path || !sessionId) return '';
+    let seen = noteSeen.get(sessionId);
+    if (!seen) {
+      seen = new Set();
+      noteSeen.set(sessionId, seen);
+    }
+    if (seen.has(live.path)) return '';
+    seen.add(live.path);
+    return renderActiveNote(live);
+  }
 
   if (!sessions) throw new Error('startConnector 需要 sessions（sessionController）');
   if (!token) throw new Error('startConnector 需要 token');
@@ -353,6 +452,38 @@ export function startConnector(options) {
       return;
     }
 
+    // 当前打开的笔记：只收「坐标」，不收正文。
+    // 正文交给 agent 需要时自己去读——一份实时读取的副本永远比每轮重发的旧副本准。
+    if (req.method === 'POST' && path === '/active-note') {
+      const payload = await readJsonBody(req, res);
+      if (!payload) return;
+      const notePath = payload.path ? String(payload.path) : null;
+      if (!notePath) {
+        activeNote = null;
+        json(res, 200, { ok: true, data: { cleared: true } });
+        return;
+      }
+      activeNote = normalizeActiveNote(payload);
+      json(res, 200, {
+        ok: true,
+        data: {
+          path: activeNote.path,
+          cursor: activeNote.cursor,
+          hasSelection: Boolean(activeNote.selection),
+        },
+      });
+      return;
+    }
+
+    if (req.method === 'GET' && path === '/active-note') {
+      const live = activeNoteOf();
+      json(res, 200, {
+        ok: true,
+        data: live ? { ...live, at: new Date(live.at).toISOString() } : null,
+      });
+      return;
+    }
+
     if (req.method === 'GET' && path === '/inject') {
       const items = injectionStore.currentItems();
       json(res, 200, {
@@ -465,12 +596,17 @@ export function startConnector(options) {
           }
         }
         const requestId = `${requestIdPrefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+        // 坐标分两种寿命：整篇的（路径/篇幅/小节）跟会话只走一趟；
+        // 光标那一句每轮都走——它随时在变，而且只占一行。
+        const live = await currentNote();
+        const noteText = takeActiveNoteFor(sessionId, live) || renderCursorLine(live);
+        const text = noteText ? noteText + '\n\n' + markSource(message) : markSource(message);
         await sessions.prompt(
           {
             requestId,
             sessionId,
             mode: payload.mode === 'steer' ? 'steer' : 'queue',
-            content: [{ type: 'text', text: markSource(message) }],
+            content: [{ type: 'text', text }],
             ...(clientTimeZone ? { clientTimeZone } : {}),
           },
           new AbortController().signal,
@@ -532,6 +668,7 @@ export function startConnector(options) {
         broadcast,
         injections: injectionStore,
         injectionState,
+        activeNote: activeNoteOf,
         close: () =>
           new Promise((done) => {
             for (const set of subscribers.values()) {

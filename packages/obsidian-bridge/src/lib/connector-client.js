@@ -149,6 +149,11 @@ function createConnectorClient(options = {}) {
     setInjection: (on) => request('/config', { method: 'POST', body: { injection: on === true } }),
     injectStatus: () => request('/inject'),
     clearInjection: (id) => request('/inject/clear', { method: 'POST', body: id ? { id } : {} }),
+    // 当前打开的笔记：推给连接器，agent 不用等主人开口就知道屏幕上是什么。
+    // path 传 null = 明确告诉连接器「现在没有打开的笔记」，别让旧的那篇一直挂着。
+    pushActiveNote: (payload) => request('/active-note', { method: 'POST', body: payload }),
+    clearActiveNote: () => request('/active-note', { method: 'POST', body: { path: null } }),
+    activeNote: () => request('/active-note', { method: 'GET' }),
 
     async subscribe(sessionId, onEvent, signal) {
       const cfg = config();

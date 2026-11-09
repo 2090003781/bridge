@@ -19,6 +19,7 @@ const { ItemView, Notice, Modal, Setting, TFolder, MarkdownRenderer } = require(
 const fs = require('node:fs');
 const { parseLedger } = __req('lib/ledger-reader.js');
 const { reconcileInjection } = __req('lib/settings.js');
+const { pickMissingReply, shouldReconcile } = __req('lib/reply-reconcile.js');
 
 const VIEW_TYPE = 'bridge-chat';
 const RECENT_LIMIT = 15;
@@ -393,6 +394,8 @@ class BridgeChatView extends ItemView {
       return;
     }
     if (type === 'turn/end') {
+      // 事件到了就是快路通了，兜底可以退休
+      this.stopReplyWatch();
       if (this.assistantBuffer) {
         this.messages.push({ role: 'assistant', text: this.assistantBuffer });
         this.assistantBuffer = '';
@@ -423,6 +426,8 @@ class BridgeChatView extends ItemView {
     }
     // 排队模式：先进合并盒，最后一次输入后静默 1.5 秒才真发出去
     this.pending.push(text);
+    // 收纳期间也要看得见：攒着不发不等于消失，否则主人以为消息丢了
+    this.render();
     if (this.pendingTimer) clearTimeout(this.pendingTimer);
     this.pendingTimer = setTimeout(() => {
       this.pendingTimer = null;
@@ -436,6 +441,7 @@ class BridgeChatView extends ItemView {
     if (!this.pending.length) return;
     const parts = this.pending.slice();
     this.pending = [];
+    this.render();
     await this.deliver(parts, false);
   }
 
@@ -451,6 +457,7 @@ class BridgeChatView extends ItemView {
       mode: isSteer ? 'steer' : 'queue',
     });
     if (!res || res.ok !== true) {
+      this.stopReplyWatch();
       const raw = (res && res.error && res.error.message) || '发送失败';
       this.setStatus('发送失败');
       if (/resume failed|not found/i.test(raw)) {
@@ -461,7 +468,61 @@ class BridgeChatView extends ItemView {
       } else {
         this.pushSystem(raw);
       }
+      return;
     }
+    // 投出去了：状态往前推一格，别一直停在「排队中」——那是在等投递，不是等回复。
+    this.setStatus('已发出，等待回复…');
+    // 起一条慢路兜底。SSE 断线、事件漏收、或者那一轮压根没产生文本，
+    // 面板都会永远停在「思考中…」，看起来就是「agent 没回我」。
+    this.startReplyWatch();
+  }
+
+  // 投递后的对账：只问会话真相（/sessions 的 running + /transcript 的消息），
+  // 不看事件。只要那一轮真的跑完了，回复就能被捞出来补上。
+  startReplyWatch() {
+    this.stopReplyWatch();
+    const startedAt = Date.now();
+    this._waitingReply = true;
+    this.replyWatchTimer = setInterval(async () => {
+      const elapsedMs = Date.now() - startedAt;
+      if (elapsedMs > 180000) {
+        this.stopReplyWatch();
+        return;
+      }
+      let running;
+      try {
+        const list = await this.plugin.connector().sessions();
+        const items = (list && list.data && list.data.sessions) || [];
+        const mine = items.find((x) => x && x.sessionId === this.sessionId);
+        running = mine ? mine.running : undefined;
+      } catch {
+        running = undefined;
+      }
+      if (!shouldReconcile({ running, waiting: this._waitingReply === true, elapsedMs })) return;
+      try {
+        const t = await this.plugin.connector().transcript(this.sessionId, 6);
+        const msgs = (t && t.data && t.data.messages) || [];
+        const missing = pickMissingReply(this.messages, msgs);
+        if (missing) {
+          this.messages.push(missing);
+          this.render();
+          this.plugin.logEvent('chat', '事件没到，按会话日志补了一条回复');
+        }
+        this.setStatus('就绪');
+        this.stopReplyWatch();
+      } catch {
+        /* 下一拍再试 */
+      }
+    }, 3000);
+    this.register(() => this.stopReplyWatch());
+  }
+
+  stopReplyWatch() {
+    if (this.replyWatchTimer) {
+      clearInterval(this.replyWatchTimer);
+      this.replyWatchTimer = null;
+    }
+    this._waitingReply = false;
   }
 
   openInjectionPanel() {
@@ -551,6 +612,14 @@ class BridgeChatView extends ItemView {
     if (this.assistantBuffer) {
       const el = this.listEl.createDiv({ cls: 'bridge-msg bridge-msg-assistant bridge-msg-streaming' });
       this.renderMarkdown(el, this.assistantBuffer);
+    }
+    // 合并盒里还攒着的：按顺序摆出来，标成「待发」，
+    // 让主人知道这几句还没出去、还会合并成一条
+    if (this.pending.length) {
+      for (const text of this.pending) {
+        const el = this.listEl.createDiv({ cls: 'bridge-msg bridge-msg-user bridge-msg-pending' });
+        el.setText(text);
+      }
     }
     this.listEl.scrollTop = this.listEl.scrollHeight;
   }
@@ -869,6 +938,15 @@ class SessionTreeModal extends Modal {
         this.render();
       });
       if (!open) continue;
+      // 这个工作区下也可以直接新建（不用回面板点「新建会话」）
+      const wsId = rows.find((x) => x.workspaceId)?.workspaceId || null;
+      const addRow = tree.createDiv({ cls: 'bridge-tree-row bridge-tree-new' });
+      addRow.style.paddingLeft = '20px';
+      addRow.createSpan({ cls: 'bridge-tree-name', text: '＋ 在此工作区新建会话' });
+      addRow.onClickEvent(() => {
+        this.close();
+        try { this.onNew(wsId); } catch { /* ignore */ }
+      });
       for (const s of rows) {
         const active = s.sessionId === this.currentId;
         const row = tree.createDiv({
@@ -884,15 +962,6 @@ class SessionTreeModal extends Modal {
             /* 回调异常不外抛 */
           }
         });
-      // 这个工作区下也可以直接新建（不用回面板点「新建会话」）
-      const wsId = rows.find((x) => x.workspaceId)?.workspaceId || null;
-      const addRow = tree.createDiv({ cls: 'bridge-tree-row bridge-tree-new' });
-      addRow.style.paddingLeft = '20px';
-      addRow.createSpan({ cls: 'bridge-tree-name', text: '＋ 在此工作区新建会话' });
-      addRow.onClickEvent(() => {
-        this.close();
-        try { this.onNew(wsId); } catch { /* ignore */ }
-      });
       }
     }
   }
@@ -1052,6 +1121,11 @@ function createConnectorClient(options = {}) {
     setInjection: (on) => request('/config', { method: 'POST', body: { injection: on === true } }),
     injectStatus: () => request('/inject'),
     clearInjection: (id) => request('/inject/clear', { method: 'POST', body: id ? { id } : {} }),
+    // 当前打开的笔记：推给连接器，agent 不用等主人开口就知道屏幕上是什么。
+    // path 传 null = 明确告诉连接器「现在没有打开的笔记」，别让旧的那篇一直挂着。
+    pushActiveNote: (payload) => request('/active-note', { method: 'POST', body: payload }),
+    clearActiveNote: () => request('/active-note', { method: 'POST', body: { path: null } }),
+    activeNote: () => request('/active-note', { method: 'GET' }),
 
     async subscribe(sessionId, onEvent, signal) {
       const cfg = config();
@@ -1374,6 +1448,229 @@ class BridgeLogModal extends Modal {
 
 module.exports = { BridgeLogModal };
 });
+__define('lib/mark-decoration.js', function (module, exports, require) {
+'use strict';
+// Bridge · 标记的视觉层（CodeMirror 6 装饰）
+//
+// 为什么不改文件：标记表示「我现在想让你看这段」，是临时指示，不是笔记内容。
+// 写进正文会污染原文、还会被同步出去，而且撤销起来很烦。
+// 所以用 decoration —— 只在屏幕上画，文档一个字节都不动。
+//
+// 两种形态对应两种画法：
+//   点标记   → 字缝之间插一个工字形（宽度 0，不挤开任何字）
+//   范围标记 → 两端各一个工字形 + 中间文字底色（边界一眼可见）
+//
+// 为什么用工字 widget 而不是整行色条：整行会把人「在看哪一行」和
+// 「在看行里哪一处」混为一谈；工字形落在字缝里，指哪打哪，也不遮文字。
+//
+// 注意：@codemirror/* 由 Obsidian 宿主提供，但不是在每个版本都保证暴露。
+// 所以这里延迟 require，且失败只让「看得见」降级，不许拖垮整个插件——
+// 标记本身（记位置、播报给模型）不依赖它。
+
+let cmCache = null;
+
+function loadCm() {
+  if (cmCache) return cmCache;
+  const view = require('@codemirror/view');
+  const state = require('@codemirror/state');
+  if (!view || !view.Decoration || !view.ViewPlugin || !state || !state.RangeSetBuilder) {
+    throw new Error('宿主没有暴露 CodeMirror 的 Decoration/ViewPlugin/RangeSetBuilder');
+  }
+  cmCache = {
+    Decoration: view.Decoration,
+    ViewPlugin: view.ViewPlugin,
+    WidgetType: view.WidgetType,
+    RangeSetBuilder: state.RangeSetBuilder,
+  };
+  return cmCache;
+}
+
+/** {line,ch} → 文档偏移；行号越界就夹到边界，ch 越界夹到行尾 */
+function offsetOf(doc, pos) {
+  const lineNo = Math.min(Math.max(1, Number(pos.line || 0) + 1), doc.lines);
+  const line = doc.line(lineNo);
+  return Math.min(line.from + Math.max(0, Number(pos.ch || 0)), line.to);
+}
+
+/**
+ * @param {{getMarks:()=>Array, getPath:()=>string}} deps
+ * getMarks 返回 [{path, marks:[{line,ch}, …]}]，getPath 返回当前编辑器对应的文件路径
+ */
+function createMarkExtension({ getMarks, getPath }) {
+  const { Decoration, ViewPlugin, RangeSetBuilder, WidgetType } = loadCm();
+  const rangeDeco = Decoration.mark({ class: 'bridge-mark-range' });
+
+  // 工字形光标：一个 0 宽度的行内元素，用伪元素画成上下横 + 中间竖
+  class BeamWidget extends WidgetType {
+    constructor(kind) {
+      super();
+      this.kind = kind; // 'point' | 'from' | 'to'
+    }
+
+    eq(other) {
+      return other && other.kind === this.kind;
+    }
+
+    toDOM() {
+      const el = document.createElement('span');
+      el.className = 'bridge-mark-beam bridge-mark-beam-' + this.kind;
+      el.setAttribute('aria-hidden', 'true');
+      return el;
+    }
+
+    // 别抢鼠标：点它应该落到文字上，不是落到标记上
+    ignoreEvent() {
+      return true;
+    }
+  }
+
+  const beamPoint = Decoration.widget({ widget: new BeamWidget('point'), side: 1 });
+  const beamFrom = Decoration.widget({ widget: new BeamWidget('from'), side: 1 });
+  const beamTo = Decoration.widget({ widget: new BeamWidget('to'), side: -1 });
+
+  const plugin = ViewPlugin.fromClass(
+    class {
+      constructor(view) {
+        this.decorations = this.build(view);
+      }
+
+      update(update) {
+        // 每次事务都重算：标记是外部状态，CM 不知道它变了，
+        // 所以外部改完标记会 dispatch 一个空事务把这里叫醒。
+        this.decorations = this.build(update.view);
+      }
+
+      build(view) {
+        let list = [];
+        try {
+          list = getMarks() || [];
+        } catch {
+          list = [];
+        }
+        const path = typeof getPath === 'function' ? getPath() : '';
+        const mine = list.filter((m) => m && m.path === path && Array.isArray(m.marks) && m.marks.length);
+
+        const items = [];
+        for (const entry of mine) {
+          const pts = entry.marks.slice(0, 2);
+          if (pts.length === 1) {
+            const at = offsetOf(view.state.doc, pts[0]);
+            items.push({ from: at, to: at, deco: beamPoint, order: 0 });
+          } else {
+            const a = offsetOf(view.state.doc, pts[0]);
+            const b = offsetOf(view.state.doc, pts[1]);
+            const from = Math.min(a, b);
+            const to = Math.max(a, b);
+            // 同一位置不能既插 widget 又标 mark，所以空范围只画一个
+            if (from === to) {
+              items.push({ from, to, deco: beamPoint, order: 0 });
+            } else {
+              items.push({ from, to: from, deco: beamFrom, order: 0 });
+              items.push({ from, to, deco: rangeDeco, order: 1 });
+              items.push({ from: to, to, deco: beamTo, order: 2 });
+            }
+          }
+        }
+        // RangeSetBuilder 要求 from 递增；同位置时按 order 排（line 在 mark 之前）
+        items.sort((x, y) => x.from - y.from || x.order - y.order);
+
+        const builder = new RangeSetBuilder();
+        for (const it of items) builder.add(it.from, it.to, it.deco);
+        return builder.finish();
+      }
+    },
+    { decorations: (v) => v.decorations },
+  );
+  return [plugin];
+}
+
+/** 标记变了之后把可见编辑器叫醒重画。没有可画的就直接跳过。 */
+function refreshAllMarkViews(views) {
+  for (const v of views || []) {
+    try {
+      if (v && typeof v.dispatch === 'function') v.dispatch({});
+    } catch {
+      /* 编辑器可能已经销毁 */
+    }
+  }
+}
+
+module.exports = { createMarkExtension, refreshAllMarkViews, offsetOf };
+
+});
+__define('lib/mark-store.js', function (module, exports, require) {
+'use strict';
+// Bridge · 临时标记
+//
+// 只有一种标记，靠按几次分形态：
+//   第 1 次 → 一个点（我在这）
+//   第 2 次 → 从第一个点到第二个点的范围（这段）
+//   第 3 次 → 清空，重新开始
+// 这样只要一个快捷键就够，不用记「打点」和「清空」是两个键。
+//
+// 标记只在内存里：它表示「此刻我想让你看这里」，不是笔记内容，
+// 不该写进文件，也不该关了 Obsidian 还留着假装有效。
+
+/** 位置比较：先比行，再比列。 */
+function comparePos(a, b) {
+  if (!a || !b) return 0;
+  if (a.line !== b.line) return a.line - b.line;
+  return (a.ch || 0) - (b.ch || 0);
+}
+
+const samePos = (a, b) => Boolean(a && b && a.line === b.line && (a.ch || 0) === (b.ch || 0));
+
+/**
+ * 按下标记键之后标记变成什么样。
+ * @param {Array} current 当前标记（[] / [点] / [from,to]）
+ * @param {{line:number,ch:number}} position 光标位置
+ * @returns {{marks:Array, mode:'empty'|'point'|'range'}}
+ */
+function nextMarkState(current, position) {
+  const list = Array.isArray(current) ? current.filter((p) => p && Number.isFinite(p.line)) : [];
+  if (!position || !Number.isFinite(position.line)) return { marks: list, mode: modeOf(list) };
+
+  if (list.length === 0) return { marks: [position], mode: 'point' };
+
+  if (list.length === 1) {
+    // 同一个位置点两次：当成「我改主意了」，直接撤掉
+    if (samePos(list[0], position)) return { marks: [], mode: 'empty' };
+    const [from, to] = comparePos(list[0], position) <= 0 ? [list[0], position] : [position, list[0]];
+    return { marks: [from, to], mode: 'range' };
+  }
+
+  // 已经是范围：再按就是清空
+  return { marks: [], mode: 'empty' };
+}
+
+function modeOf(marks) {
+  const list = Array.isArray(marks) ? marks : [];
+  if (list.length === 0) return 'empty';
+  return list.length >= 2 ? 'range' : 'point';
+}
+
+/** 给人看的一句话：标记在哪。没有标记时返回空串。 */
+function describeMarks(marks) {
+  const list = Array.isArray(marks) ? marks : [];
+  if (!list.length) return '';
+  if (list.length === 1) return '标记在第 ' + (list[0].line + 1) + ' 行第 ' + ((list[0].ch || 0) + 1) + ' 列';
+  const a = list[0];
+  const b = list[1];
+  const head = '标记范围第 ' + (a.line + 1);
+  const tail = (b.line + 1) + ' 行';
+  return head + (a.line === b.line ? ' 行' : ' → ' + tail);
+}
+
+/** 标记还在不在这篇里（换了文件就当没有）。 */
+function marksForPath(all, path) {
+  if (!Array.isArray(all)) return [];
+  const hit = all.find((m) => m && m.path === path);
+  return hit && Array.isArray(hit.marks) ? hit.marks : [];
+}
+
+module.exports = { nextMarkState, describeMarks, marksForPath, comparePos, modeOf };
+
+});
 __define('lib/permissions.js', function (module, exports, require) {
 'use strict';
 // Bridge · 权限（三档，按客户端记档）
@@ -1506,6 +1803,26 @@ function activeEditor(obsidian) {
   return { view, editor: view.editor, file: view.file || null };
 }
 
+// 「屏幕上那一篇」不一定有焦点：在主面板里打字时，焦点在输入框上，
+// activeLeaf 就是面板本身，而不是笔记。这时候要找还开着的 Markdown 视图——
+// 主人刚从那一篇切过来，它才是他在看的东西，光标是他离开时停的地方。
+// 写操作仍然只认 activeEditor：没有焦点就不该替他改。
+function screenEditor(obsidian) {
+  const ws = obsidian && obsidian.workspace;
+  if (!ws) return null;
+  const active = activeEditor(obsidian);
+  if (active && active.file) return { ...active, focused: true };
+  const leaves = typeof ws.getLeavesOfType === 'function' ? ws.getLeavesOfType('markdown') : [];
+  for (let i = leaves.length - 1; i >= 0; i -= 1) {
+    const leaf = leaves[i];
+    const view = leaf && leaf.view;
+    if (view && view.editor && view.file) {
+      return { view, editor: view.editor, file: view.file, focused: false };
+    }
+  }
+  return null;
+}
+
 function requireEditor(ctx) {
   const active = activeEditor(ctx.obsidian);
   if (!active) throw opError('no-active-editor', '没有打开的 Markdown 编辑器（先在 Obsidian 里打开一篇笔记）');
@@ -1567,10 +1884,10 @@ const OPS = [
   {
     id: 'obsidian.editor.state',
     tier: 'read',
-    summary: '当前活跃编辑器的状态：路径 / 光标 / 选区 / 行数',
+    summary: '屏幕上那篇笔记：路径 / 光标最后位置 / 选区 / 行数（焦点不在编辑器里也照样算）',
     run(ctx) {
-      const active = activeEditor(ctx.obsidian);
-      if (!active) return { available: false, reason: 'no-active-editor' };
+      const active = screenEditor(ctx.obsidian);
+      if (!active) return { available: false, reason: 'no-open-note' };
       const ed = active.editor;
       const cursor = typeof ed.getCursor === 'function' ? ed.getCursor() : null;
       const selected = typeof ed.getSelection === 'function' ? ed.getSelection() : '';
@@ -1587,6 +1904,9 @@ const OPS = [
         available: true,
         path: active.file ? active.file.path : null,
         mode: active.view.getMode ? active.view.getMode() : null,
+        // focused=false：这不是焦点所在的编辑器（比如焦点在 Bridge 面板输入框里），
+        // 光标是主人最后一次停在那里的位置，仍然说明他在看哪一段。
+        focused: active.focused !== false,
         cursor,
         selection: selected
           ? { text: selected.length > 2000 ? `${selected.slice(0, 2000)}…` : selected, length: selected.length, from, to }
@@ -2257,6 +2577,59 @@ function createRegistry(deps) {
 
 module.exports = { createRegistry, OPS };
 });
+__define('lib/reply-reconcile.js', function (module, exports, require) {
+'use strict';
+// Bridge · 面板回复对账
+//
+// 事件（SSE）是快路，但会丢：断线、重连窗口、那一轮压根没产生文本、
+// 或者事件名/结构变了。丢了之后面板就永远停在「思考中…」，看起来就是
+// 「agent 没回我」。
+//
+// 这里给一条慢路：只问会话真相（/sessions 的 running + /transcript 的消息），
+// 不看事件。只要那一轮真的跑完了，回复就能被捞出来补上。
+// 纯函数，不碰网络，好测。
+
+/** 面板里已经显示过的 assistant 文本集合（用来判断「这条补过没有」） */
+function shownAssistantTexts(shown) {
+  const set = new Set();
+  for (const m of Array.isArray(shown) ? shown : []) {
+    if (m && m.role === 'assistant' && typeof m.text === 'string') set.add(m.text);
+  }
+  return set;
+}
+
+/**
+ * 该不该把某条回复补到面板上。
+ * @param {Array} shown     面板已显示的消息（{role,text}）
+ * @param {Array} transcript 会话日志里的最近消息（{role,text}）
+ * @returns {{role:string,text:string}|null} 要补的那条；没得补就 null
+ */
+function pickMissingReply(shown, transcript) {
+  const list = Array.isArray(transcript) ? transcript : [];
+  const last = [...list]
+    .reverse()
+    .find((m) => m && m.role === 'assistant' && typeof m.text === 'string' && m.text.trim());
+  if (!last) return null;
+  if (shownAssistantTexts(shown).has(last.text)) return null;
+  return { role: 'assistant', text: last.text };
+}
+
+/**
+ * 现在该不该去对账。
+ * @param {{running:boolean, waiting:boolean, elapsedMs:number, timeoutMs?:number}} input
+ */
+function shouldReconcile({ running, waiting, elapsedMs, timeoutMs = 180000 } = {}) {
+  if (waiting !== true) return false;
+  if (!Number.isFinite(elapsedMs) || elapsedMs > timeoutMs) return false;
+  // 只有「明确已经停了」才对账：
+  // running=true（还在跑，事件可能只是慢）和 undefined（会话列表还没刷新，
+  // 查不到等于不知道）都不插手，免得误判成跑完、把机会让给一条旧回复。
+  return running === false;
+}
+
+module.exports = { pickMissingReply, shouldReconcile };
+
+});
 __define('lib/server.js', function (module, exports, require) {
 'use strict';
 // Bridge · HTTP 入口
@@ -2703,7 +3076,7 @@ __define('main.js', function (module, exports, require) {
 // 定位：独立插件，与枢阁（8790 / 8848）无任何联系，只干 Obsidian 内部能力。
 // 生命周期：Obsidian 开着 = Bridge 在；服务只监听回环，除 /health 外都要 token。
 
-const { Plugin, Notice, PluginSettingTab, Setting } = require('obsidian');
+const { Plugin, Notice, PluginSettingTab, Setting, Modal } = require('obsidian');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -2721,12 +3094,33 @@ const { BridgeChatView, VIEW_TYPE: CHAT_VIEW_TYPE } = __req('lib/chat-view.js');
 const { createConnectorClient } = __req('lib/connector-client.js');
 const { BridgeLogModal } = __req('lib/log-view.js');
 const { createPluginLog } = __req('lib/plugin-log.js');
+const { createMarkExtension, refreshAllMarkViews } = __req('lib/mark-decoration.js');
+const { nextMarkState, describeMarks, marksForPath } = __req('lib/mark-store.js');
 
 const INFO_DIR = path.join(os.homedir(), '.obsidian-bridge');
 const CONNECTOR_FILE = path.join(os.homedir(), '.dsh-bridge', 'connector.json');
 
 module.exports = class ObsidianBridgePlugin extends Plugin {
   async onload() {
+    try {
+      await this._onload();
+    } catch (err) {
+      const detail = String((err && err.stack) || err);
+      try {
+        fs.writeFileSync(
+          path.join(os.tmpdir(), 'bridge-onload-error.txt'),
+          new Date().toISOString() + '\n' + detail,
+          'utf8',
+        );
+      } catch {
+        /* 连错误都写不下去就只能靠下面这条 Notice 了 */
+      }
+      new Notice('Bridge 加载失败：' + detail.split('\n')[0], 15000);
+      throw err;
+    }
+  }
+
+  async _onload() {
     this.settings = normalizeSettings(await this.loadData());
     this.core = null;
     this.permissions = null;
@@ -2768,6 +3162,55 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
 
     this.addSettingTab(new BridgeSettingTab(this, this.app));
 
+    // 标记：只在屏幕上画（CodeMirror 装饰），文档一个字节都不动。
+    // 装饰层拿不到就降级——标记本身的记录和播报不依赖它，别为了「看得见」
+    // 把整个插件搞挂（那样连命令都注册不上）。
+    this._marks = [];
+    this._markVisible = false;
+    try {
+      this.registerEditorExtension(
+        createMarkExtension({
+          getMarks: () => this._marks,
+          getPath: () => {
+            const file = this.app.workspace.getActiveFile();
+            return file ? file.path : '';
+          },
+        }),
+      );
+      this._markVisible = true;
+    } catch (err) {
+      this.logEvent('mark', '装饰层不可用，标记只能靠状态栏和播报：' + String((err && err.message) || err));
+    }
+    this.addCommand({
+      id: 'bridge-mark-here',
+      name: '标记：标记这里（再按变范围，第三次清除）',
+      hotkeys: [{ modifiers: ['Mod', 'Shift'], key: 'm' }],
+      callback: () => this.toggleMark(),
+    });
+    this.addCommand({
+      id: 'bridge-mark-clear',
+      name: '标记：清除全部',
+      callback: () => this.clearMarks(),
+    });
+
+    // 右键菜单：比快捷键顺手，不用记键。光标停在哪就标哪。
+    this.registerEvent(
+      this.app.workspace.on('editor-menu', (menu) => {
+        menu.addItem((item) =>
+          item
+            .setTitle('Bridge：标记这里（再点一次成范围）')
+            .setIcon('highlighter')
+            .onClick(() => this.toggleMark()),
+        );
+        menu.addItem((item) =>
+          item.setTitle('Bridge：清除标记').setIcon('eraser').onClick(() => this.clearMarks()),
+        );
+      }),
+    );
+
+    // 当前打开的笔记：持续推给连接器，让 agent 不用等主人开口就知道屏幕上是什么。
+    this.trackActiveNote();
+
     // 上次面板是开着的就自动恢复：改代码后 reload、或者重启 Obsidian，
     // 侧栏那个视图会被一起收掉，不该让主人每次都手动点回来。
     if (this.settings.chatOpen) {
@@ -2808,6 +3251,328 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
       });
     }
     return this._connector;
+  }
+
+  // 当前打开的笔记 —— 推给连接器，agent 那边就能直接读到「屏幕上这一篇」。
+  // 内容取编辑器缓冲（getValue），所以还没保存的改动也在里面，这正是要的效果。
+  // 屏幕上那篇笔记（不看焦点）：焦点在面板输入框时 activeLeaf 是面板，
+  // 所以要先看活跃编辑器，没有就问布局「哪个 markdown 标签活着」。
+  topMarkdownView() {
+    const ws = this.app.workspace;
+    const isMd = (v) => Boolean(v && v.file && v.editor && typeof v.editor.getValue === 'function');
+    const active = ws.activeLeaf && ws.activeLeaf.view;
+    if (isMd(active)) return active;
+
+    const hits = [];
+    const walk = (node, depth) => {
+      if (!node || depth > 8) return;
+      if (typeof node.getActiveLeaf === 'function') {
+        const leaf = node.getActiveLeaf();
+        if (leaf && isMd(leaf.view)) hits.push(leaf.view);
+      }
+      for (const child of node.children || []) walk(child, depth + 1);
+    };
+    try {
+      walk(ws.rootSplit, 0);
+    } catch {
+      /* 布局还在重建 */
+    }
+    if (hits[0]) return hits[0];
+
+    const leaves = typeof ws.getLeavesOfType === 'function' ? ws.getLeavesOfType('markdown') : [];
+    for (let i = leaves.length - 1; i >= 0; i -= 1) {
+      const v = leaves[i] && leaves[i].view;
+      if (isMd(v)) return v;
+    }
+    return null;
+  }
+
+  // 标记：一个快捷键搞定「点 → 范围 → 清空」三种结果，不用记两个键。
+  toggleMark() {
+    const view = this.topMarkdownView();
+    const file = view && view.file;
+    const editor = view && view.editor;
+    if (!file || !editor) {
+      new Notice('没有打开的笔记，先点开一篇再标记');
+      return;
+    }
+    const cursor = typeof editor.getCursor === 'function' ? editor.getCursor() : null;
+    const current = marksForPath(this._marks, file.path);
+    const next = nextMarkState(current, cursor);
+    const kept = this._marks.filter((m) => m.path !== file.path);
+    if (next.marks.length) kept.push({ path: file.path, marks: next.marks });
+    this._marks = kept;
+    this.refreshMarkViews();
+    const desc = describeMarks(next.marks);
+    new Notice(desc || '标记已清除');
+    this.renderMarkStatus();
+    // 标记变了立刻告诉连接器，别等下一次切换
+    if (typeof this._flushActiveNote === 'function') this._flushActiveNote();
+  }
+
+  clearMarks() {
+    this._marks = [];
+    this.refreshMarkViews();
+    this.renderMarkStatus();
+    new Notice('标记已清除');
+    if (typeof this._flushActiveNote === 'function') this._flushActiveNote();
+  }
+
+  // 标记是外部状态，CodeMirror 不知道它变了：dispatch 一个空事务把装饰层叫醒
+  refreshMarkViews() {
+    const views = [];
+    const leaves =
+      typeof this.app.workspace.getLeavesOfType === 'function'
+        ? this.app.workspace.getLeavesOfType('markdown')
+        : [];
+    for (const leaf of leaves) {
+      const v = leaf && leaf.view;
+      if (v && v.editor && v.editor.cm) views.push(v.editor.cm);
+    }
+    refreshAllMarkViews(views);
+  }
+
+  renderMarkStatus() {
+    if (!this.markStatusEl) this.markStatusEl = this.addStatusBarItem();
+    const view = this.topMarkdownView();
+    const file = view && view.file;
+    const marks = file ? marksForPath(this._marks, file.path) : [];
+    this.markStatusEl.setText(describeMarks(marks));
+    this.markStatusEl.style.display = marks.length ? '' : 'none';
+  }
+
+  // 当前打开的笔记 —— 只推「坐标」，不推正文。
+  // 模型要知道的是：在看哪一篇、多大、光标停在第几行哪一节、有没有选中东西。
+  // 这些几十个字就够；正文它自己去读，读到的才是最新的那份。
+  trackActiveNote() {
+    let lastKey = null;
+    // 上一轮推上去的是哪一篇：焦点跑掉、布局也找不到时，用它兜底
+    let lastPath = null;
+    let timer = null;
+    let inflight = false;
+    this._activeNoteWarned = false;
+
+    const pad = (n) => String(n).padStart(2, '0');
+    const stamp = (ms) => {
+      const d = new Date(ms);
+      return (
+        d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+        ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes())
+      );
+    };
+    // 光标所在的最近一节标题：从光标所在行往上找第一个 # 开头的行
+    const headingAt = (text, line) => {
+      const rows = String(text || '').split('\n');
+      for (let i = Math.min(line, rows.length - 1); i >= 0; i -= 1) {
+        const m = /^(#{1,6})\s+(.+)$/.exec(rows[i]);
+        if (m) return m[1] + ' ' + m[2].trim();
+      }
+      return null;
+    };
+
+    const isMdView = (v) =>
+      Boolean(
+        v &&
+          v.file &&
+          v.editor &&
+          typeof v.editor.getValue === 'function' &&
+          (!v.file.extension || v.file.extension === 'md'),
+      );
+
+    // 主编辑区（不含左右侧栏）里当前激活的 Markdown 视图。
+    // 「屏幕上那篇」不一定有焦点：在面板输入框里打字时，activeLeaf 就是面板本身，
+    // 所以焦点不可靠；这里直接问布局「哪个 markdown 标签现在是活的」。
+    const mainMarkdownView = () => {
+      const ws = this.app.workspace;
+      const hits = [];
+      const walk = (node, depth) => {
+        if (!node || depth > 8) return;
+        if (typeof node.getActiveLeaf === 'function') {
+          const leaf = node.getActiveLeaf();
+          if (leaf && isMdView(leaf.view)) hits.push(leaf.view);
+        }
+        for (const child of node.children || []) walk(child, depth + 1);
+      };
+      try {
+        walk(ws.rootSplit, 0);
+      } catch {
+        /* 布局还在重建 */
+      }
+      return hits[0] || null;
+    };
+
+    const readActive = () => {
+      const workspace = this.app.workspace;
+      const activeView = workspace.activeLeaf && workspace.activeLeaf.view;
+      // ① 焦点就在编辑器里：最准
+      if (isMdView(activeView)) {
+        return { file: activeView.file, editor: activeView.editor, focused: true };
+      }
+      // ② 焦点在面板/侧栏：看主编辑区最上层那篇
+      const top = mainMarkdownView();
+      if (top) return { file: top.file, editor: top.editor, focused: false };
+
+      const leaves =
+        typeof workspace.getLeavesOfType === 'function' ? workspace.getLeavesOfType('markdown') : [];
+      // ③ 上一轮那篇还开着
+      if (lastPath) {
+        for (const leaf of leaves) {
+          const v = leaf && leaf.view;
+          if (isMdView(v) && v.file.path === lastPath) {
+            return { file: v.file, editor: v.editor, focused: false };
+          }
+        }
+      }
+      // ④ 兜底：还开着的任意一篇
+      for (let i = leaves.length - 1; i >= 0; i -= 1) {
+        const v = leaves[i] && leaves[i].view;
+        if (isMdView(v)) return { file: v.file, editor: v.editor, focused: false };
+      }
+      return null;
+    };
+
+    const describe = (file, editor, focused) => {
+      let text = '';
+      try {
+        text = editor.getValue();
+      } catch {
+        text = '';
+      }
+      const cursor = typeof editor.getCursor === 'function' ? editor.getCursor() : null;
+      let selText = '';
+      try {
+        selText = typeof editor.getSelection === 'function' ? editor.getSelection() : '';
+      } catch {
+        selText = '';
+      }
+      let selection = null;
+      if (selText) {
+        const from = typeof editor.getCursor === 'function' ? editor.getCursor('from') : cursor;
+        const to = typeof editor.getCursor === 'function' ? editor.getCursor('to') : cursor;
+        if (from && to) {
+          selection = {
+            fromLine: from.line,
+            fromCh: from.ch,
+            toLine: to.line,
+            toCh: to.ch,
+            chars: selText.length,
+            // 只给开头一段：知道选的是哪块就够，全文它自己会去取
+            preview: selText.slice(0, 300),
+          };
+        }
+      }
+      const mtime = file.stat && file.stat.mtime ? file.stat.mtime : null;
+      const base = this.app.vault.adapter.getBasePath() || '';
+      // 另外还开着哪几篇：让他知道我可能有别的参考物，而不是只有这一篇
+      const leaves =
+        typeof this.app.workspace.getLeavesOfType === 'function'
+          ? this.app.workspace.getLeavesOfType('markdown')
+          : [];
+      const others = leaves
+        .map((leaf) => leaf && leaf.view && leaf.view.file && leaf.view.file.path)
+        .filter((x) => x && x !== file.path);
+      return {
+        path: file.path,
+        absPath: base ? path.join(base, file.path) : null,
+        title: file.basename,
+        charCount: text.length,
+        lineCount:
+          typeof editor.lineCount === 'function' ? editor.lineCount() : text.split('\n').length,
+        updatedAt: mtime ? stamp(mtime) : null,
+        cursor: cursor ? { line: cursor.line, ch: cursor.ch } : null,
+        selection,
+        heading: cursor ? headingAt(text, cursor.line) : null,
+        // 焦点在不在编辑器里：不在的时候光标是「最后一次停的位置」，不是实时值
+        focused,
+        others: others.slice(0, 8),
+        // 当前这篇上的临时标记（最多两个：点 / 范围）
+        marks: marksForPath(this._marks, file.path).slice(0, 2),
+        // 明确告诉连接器「选区这事我查过了」，免得它把「不知道」说成「没有」
+        checked: true,
+      };
+    };
+
+    const keyOf = (d) =>
+      [
+        d.path,
+        d.cursor ? d.cursor.line + ':' + d.cursor.ch : '',
+        d.selection ? d.selection.chars : '',
+        d.charCount,
+        d.updatedAt,
+      ].join('|');
+
+    const flush = async (force) => {
+      if (inflight) return;
+      const cur = readActive();
+      if (!cur) {
+        // 一篇 Markdown 都没开着（全关了）：才清空，
+        // 否则上一篇会一直挂在提示词里冒充「当前」。
+        // 注意「焦点跑到面板上」不算——那篇还开着，人还在看它。
+        if (lastKey !== null) {
+          lastKey = null;
+          inflight = true;
+          try {
+            await this.connector().clearActiveNote();
+            this.logEvent('active-note', '清空当前笔记（切到了没有正文的视图）');
+          } catch {
+            /* 连接器没起来不刷屏 */
+          } finally {
+            inflight = false;
+          }
+        }
+        return;
+      }
+      const note = describe(cur.file, cur.editor, cur.focused);
+      const key = keyOf(note);
+      if (!force && key === lastKey) return;
+      lastKey = key;
+      inflight = true;
+      try {
+        const res = await this.connector().pushActiveNote(note);
+        if (res && res.ok === false) throw new Error((res.error && res.error.message) || '推送失败');
+        this._activeNoteWarned = false;
+        lastPath = note.path;
+      } catch (err) {
+        // 只报第一次：同一句失败反复刷日志没有信息量
+        if (!this._activeNoteWarned) {
+          this._activeNoteWarned = true;
+          this.logEvent('active-note', '同步当前笔记失败：' + String((err && err.message) || err));
+        }
+      } finally {
+        inflight = false;
+      }
+    };
+
+    const schedule = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        flush(false);
+      }, 1200);
+    };
+
+    this.registerEvent(this.app.workspace.on('active-leaf-change', () => flush(true)));
+    this.registerEvent(this.app.workspace.on('file-open', () => flush(true)));
+    this.registerEvent(this.app.workspace.on('editor-change', () => schedule()));
+    this.registerEvent(this.app.vault.on('rename', () => schedule()));
+    this.registerEvent(this.app.vault.on('delete', () => schedule()));
+
+    // 光标不在这里轮询：投递那一刻连接器会现查一次，比轮询准、也省得后台一直动。
+    // 这里只负责「切到哪一篇、改了什么」这类真正在变的信息。
+    this.register(() => {
+      if (timer) clearTimeout(timer);
+      try {
+        this.connector().clearActiveNote();
+      } catch {
+        /* 卸载阶段连接器可能已经关了 */
+      }
+    });
+    // 让标记之类的动作能立刻触发一次推送，不用等下一个事件
+    this._flushActiveNote = () => flush(true);
+
+    // 启动时先报一次：面板可能还要等 1.5 秒才开，但坐标现在就能给
+    const kick = setTimeout(() => flush(true), 1200);
+    this.register(() => clearTimeout(kick));
   }
 
   async activateChat() {
@@ -3067,6 +3832,147 @@ class BridgeSettingTab extends PluginSettingTab {
     this.plugin = plugin;
   }
 
+  // 把 hotkey 数组格式化成给人看的字符串（Mod 按平台显示成 Cmd / Ctrl）
+  formatHotkeys(list) {
+    return (Array.isArray(list) ? list : [])
+      .map((h) =>
+        h && Array.isArray(h.modifiers) && h.key
+          ? h.modifiers
+              .map((m) => (m === 'Mod' ? (process.platform === 'darwin' ? 'Cmd' : 'Ctrl') : m))
+              .concat(String(h.key).toUpperCase())
+              .join('+')
+          : '',
+      )
+      .filter(Boolean)
+      .join(' / ');
+  }
+
+  // 快捷键行：长相和 Obsidian「设置 → 快捷键」里那一行一样
+  // （列出已绑定的键、+ 添加、点键删除），但数据读写的是 hotkeyManager 本身。
+  // 所以这里改的 = 快捷键页里看到的 = 实际生效的，三处同一个真相，
+  // 冲突检测也仍然归 Obsidian 管。
+  addHotkeySetting(containerEl, { commandId, name, desc, defaults }) {
+    const mgr = this.app.hotkeyManager;
+    const available = mgr && typeof mgr.setHotkeys === 'function';
+    const host = containerEl.createDiv({ cls: 'bridge-hotkey-host' });
+
+    const readCurrent = () => {
+      try {
+        return available && typeof mgr.getHotkeys === 'function' ? mgr.getHotkeys(commandId) || [] : [];
+      } catch {
+        return [];
+      }
+    };
+
+    const write = (list) => {
+      try {
+        mgr.setHotkeys(commandId, list);
+        return true;
+      } catch (err) {
+        new Notice('写入快捷键失败：' + String((err && err.message) || err));
+        return false;
+      }
+    };
+
+    const redraw = () => {
+      host.empty();
+      const setting = new Setting(host).setName(name);
+      const list = readCurrent();
+      const label = this.formatHotkeys(list);
+      setting.setDesc(desc + '　已绑定：' + (label || '无'));
+
+      // 版本不支持写快捷键：只给一个跳转
+      if (!available) {
+        setting.addButton((b) =>
+          b.setButtonText('去「设置 → 快捷键」').onClick(() => {
+            try {
+              this.app.setting.open();
+              this.app.setting.openTabById('hotkeys');
+            } catch {
+              /* 界面结构变了就只提示 */
+            }
+          }),
+        );
+        return;
+      }
+
+      // 只允许一个快捷键（master 的要求）：多余的清掉，只留第一个
+      if (list.length > 1) {
+        write([list[0]]);
+      }
+
+      // 录制靠一个只读输入框：点它有焦点，keydown 一定收得到。
+      // 之前试过在设置页挂 document 监听、又试过弹 Modal，都没收到按键——
+      // 焦点不在自己手上时按键会被别处吃掉。输入框不会有这个问题。
+      let pending = null;
+      setting.addText((text) => {
+        text.setPlaceholder('点这里，然后按组合键');
+        text.inputEl.readOnly = true;
+        text.inputEl.addEventListener('keydown', (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          if (ev.key === 'Escape') {
+            pending = null;
+            text.setValue('');
+            return;
+          }
+          const mods = [];
+          if (ev.ctrlKey || ev.metaKey) mods.push('Mod');
+          if (ev.shiftKey) mods.push('Shift');
+          if (ev.altKey) mods.push('Alt');
+          if (['Control', 'Shift', 'Alt', 'Meta', 'OS'].includes(ev.key)) {
+            // 只按修饰键也给回显，让人确认识别到了
+            text.setValue(mods.length ? this.formatHotkeys([{ modifiers: mods, key: '' }]).replace(/\+$/, '+ …') : '');
+            return;
+          }
+          const key = ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
+          pending = { modifiers: mods, key };
+          text.setValue(this.formatHotkeys([pending]));
+        });
+      });
+      setting.addButton((btn) =>
+        btn.setButtonText('设为').setCta().onClick(() => {
+          if (!pending) {
+            new Notice('先在左边的框里按一个组合键');
+            return;
+          }
+          // 只留这一个：替换，不追加
+          if (write([pending])) {
+            new Notice('标记快捷键已设为 ' + this.formatHotkeys([pending]));
+            redraw();
+          }
+        }),
+      );
+
+      // 清除
+      setting.addExtraButton((btn) =>
+        btn
+          .setIcon('trash-2')
+          .setTooltip('清除快捷键')
+          .onClick(() => {
+            if (write([])) {
+              new Notice('标记快捷键已清除');
+              redraw();
+            }
+          }),
+      );
+
+      // 恢复默认
+      setting.addExtraButton((btn) =>
+        btn
+          .setIcon('rotate-ccw')
+          .setTooltip('恢复默认（Ctrl/Cmd+Shift+M）')
+          .onClick(() => {
+            if (write(defaults)) {
+              new Notice('已恢复默认快捷键');
+              redraw();
+            }
+          }),
+      );
+    };
+
+    redraw();
+  }
   display() {
     const { containerEl } = this;
     const plugin = this.plugin;
@@ -3085,6 +3991,15 @@ class BridgeSettingTab extends PluginSettingTab {
         : '未运行';
 
     new Setting(containerEl).setName('服务状态').setDesc(runtime);
+
+    // 标记快捷键：这里读写的是 Obsidian 的 hotkeyManager 本身，
+    // 不自己存一份——设置页改的、快捷键页看到的、实际生效的，三处同一个真相。
+    this.addHotkeySetting(containerEl, {
+      commandId: 'obsidian-bridge:bridge-mark-here',
+      name: '标记快捷键',
+      desc: '在光标处打标记；再按一次成范围，第三次清除。',
+      defaults: [{ modifiers: ['Mod', 'Shift'], key: 'm' }],
+    });
 
     new Setting(containerEl)
       .setName('启用 Bridge 服务')

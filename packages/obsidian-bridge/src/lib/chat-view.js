@@ -6,6 +6,7 @@ const { ItemView, Notice, Modal, Setting, TFolder, MarkdownRenderer } = require(
 const fs = require('node:fs');
 const { parseLedger } = require('./ledger-reader.js');
 const { reconcileInjection } = require('./settings.js');
+const { pickMissingReply, shouldReconcile } = require('./reply-reconcile.js');
 
 const VIEW_TYPE = 'bridge-chat';
 const RECENT_LIMIT = 15;
@@ -380,6 +381,8 @@ class BridgeChatView extends ItemView {
       return;
     }
     if (type === 'turn/end') {
+      // 事件到了就是快路通了，兜底可以退休
+      this.stopReplyWatch();
       if (this.assistantBuffer) {
         this.messages.push({ role: 'assistant', text: this.assistantBuffer });
         this.assistantBuffer = '';
@@ -410,6 +413,8 @@ class BridgeChatView extends ItemView {
     }
     // 排队模式：先进合并盒，最后一次输入后静默 1.5 秒才真发出去
     this.pending.push(text);
+    // 收纳期间也要看得见：攒着不发不等于消失，否则主人以为消息丢了
+    this.render();
     if (this.pendingTimer) clearTimeout(this.pendingTimer);
     this.pendingTimer = setTimeout(() => {
       this.pendingTimer = null;
@@ -423,6 +428,7 @@ class BridgeChatView extends ItemView {
     if (!this.pending.length) return;
     const parts = this.pending.slice();
     this.pending = [];
+    this.render();
     await this.deliver(parts, false);
   }
 
@@ -438,6 +444,7 @@ class BridgeChatView extends ItemView {
       mode: isSteer ? 'steer' : 'queue',
     });
     if (!res || res.ok !== true) {
+      this.stopReplyWatch();
       const raw = (res && res.error && res.error.message) || '发送失败';
       this.setStatus('发送失败');
       if (/resume failed|not found/i.test(raw)) {
@@ -448,7 +455,61 @@ class BridgeChatView extends ItemView {
       } else {
         this.pushSystem(raw);
       }
+      return;
     }
+    // 投出去了：状态往前推一格，别一直停在「排队中」——那是在等投递，不是等回复。
+    this.setStatus('已发出，等待回复…');
+    // 起一条慢路兜底。SSE 断线、事件漏收、或者那一轮压根没产生文本，
+    // 面板都会永远停在「思考中…」，看起来就是「agent 没回我」。
+    this.startReplyWatch();
+  }
+
+  // 投递后的对账：只问会话真相（/sessions 的 running + /transcript 的消息），
+  // 不看事件。只要那一轮真的跑完了，回复就能被捞出来补上。
+  startReplyWatch() {
+    this.stopReplyWatch();
+    const startedAt = Date.now();
+    this._waitingReply = true;
+    this.replyWatchTimer = setInterval(async () => {
+      const elapsedMs = Date.now() - startedAt;
+      if (elapsedMs > 180000) {
+        this.stopReplyWatch();
+        return;
+      }
+      let running;
+      try {
+        const list = await this.plugin.connector().sessions();
+        const items = (list && list.data && list.data.sessions) || [];
+        const mine = items.find((x) => x && x.sessionId === this.sessionId);
+        running = mine ? mine.running : undefined;
+      } catch {
+        running = undefined;
+      }
+      if (!shouldReconcile({ running, waiting: this._waitingReply === true, elapsedMs })) return;
+      try {
+        const t = await this.plugin.connector().transcript(this.sessionId, 6);
+        const msgs = (t && t.data && t.data.messages) || [];
+        const missing = pickMissingReply(this.messages, msgs);
+        if (missing) {
+          this.messages.push(missing);
+          this.render();
+          this.plugin.logEvent('chat', '事件没到，按会话日志补了一条回复');
+        }
+        this.setStatus('就绪');
+        this.stopReplyWatch();
+      } catch {
+        /* 下一拍再试 */
+      }
+    }, 3000);
+    this.register(() => this.stopReplyWatch());
+  }
+
+  stopReplyWatch() {
+    if (this.replyWatchTimer) {
+      clearInterval(this.replyWatchTimer);
+      this.replyWatchTimer = null;
+    }
+    this._waitingReply = false;
   }
 
   openInjectionPanel() {
@@ -538,6 +599,14 @@ class BridgeChatView extends ItemView {
     if (this.assistantBuffer) {
       const el = this.listEl.createDiv({ cls: 'bridge-msg bridge-msg-assistant bridge-msg-streaming' });
       this.renderMarkdown(el, this.assistantBuffer);
+    }
+    // 合并盒里还攒着的：按顺序摆出来，标成「待发」，
+    // 让主人知道这几句还没出去、还会合并成一条
+    if (this.pending.length) {
+      for (const text of this.pending) {
+        const el = this.listEl.createDiv({ cls: 'bridge-msg bridge-msg-user bridge-msg-pending' });
+        el.setText(text);
+      }
     }
     this.listEl.scrollTop = this.listEl.scrollHeight;
   }
@@ -856,6 +925,15 @@ class SessionTreeModal extends Modal {
         this.render();
       });
       if (!open) continue;
+      // 这个工作区下也可以直接新建（不用回面板点「新建会话」）
+      const wsId = rows.find((x) => x.workspaceId)?.workspaceId || null;
+      const addRow = tree.createDiv({ cls: 'bridge-tree-row bridge-tree-new' });
+      addRow.style.paddingLeft = '20px';
+      addRow.createSpan({ cls: 'bridge-tree-name', text: '＋ 在此工作区新建会话' });
+      addRow.onClickEvent(() => {
+        this.close();
+        try { this.onNew(wsId); } catch { /* ignore */ }
+      });
       for (const s of rows) {
         const active = s.sessionId === this.currentId;
         const row = tree.createDiv({
@@ -871,15 +949,6 @@ class SessionTreeModal extends Modal {
             /* 回调异常不外抛 */
           }
         });
-      // 这个工作区下也可以直接新建（不用回面板点「新建会话」）
-      const wsId = rows.find((x) => x.workspaceId)?.workspaceId || null;
-      const addRow = tree.createDiv({ cls: 'bridge-tree-row bridge-tree-new' });
-      addRow.style.paddingLeft = '20px';
-      addRow.createSpan({ cls: 'bridge-tree-name', text: '＋ 在此工作区新建会话' });
-      addRow.onClickEvent(() => {
-        this.close();
-        try { this.onNew(wsId); } catch { /* ignore */ }
-      });
       }
     }
   }

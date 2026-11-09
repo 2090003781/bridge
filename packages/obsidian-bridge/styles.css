@@ -1,4 +1,4 @@
-.bridge-chat {
+﻿.bridge-chat {
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -64,7 +64,7 @@
 .bridge-chat-send {
   align-self: flex-end;
 }
-/* ── Bridge 日志视图 ── */
+/* 鈹€鈹€ Bridge 鏃ュ織瑙嗗浘 鈹€鈹€ */
 .bridge-log { display: flex; flex-direction: column; height: 100%; gap: 6px; padding: 8px; }
 .bridge-log-bar { display: flex; gap: 6px; align-items: center; }
 .bridge-log-tab { font-size: 12px; }
@@ -81,7 +81,7 @@
 .bridge-log-runtime { flex: 1; overflow: auto; }
 .bridge-log-pre { white-space: pre-wrap; font-size: 12px; }
 .bridge-log-empty { color: var(--text-faint); font-size: 12px; padding: 12px; }
-/* ── Bridge 主面板（左 1/3 功能 / 右 2/3 对话） ── */
+/* 鈹€鈹€ Bridge 涓婚潰鏉匡紙宸?1/3 鍔熻兘 / 鍙?2/3 瀵硅瘽锛?鈹€鈹€ */
 .bridge-panel { padding: 0; height: 100%; }
 .bridge-panel-main { display: flex; flex-direction: column; height: 100%; min-height: 0; }
 .bridge-panel-side {
@@ -119,9 +119,9 @@
 .bridge-log-modal .modal-content { height: 100%; }
 .bridge-log-modal .bridge-log { height: 100%; }
 
-/* ── 注入面板 ── */
+/* 鈹€鈹€ 娉ㄥ叆闈㈡澘 鈹€鈹€ */
 .bridge-inject-modal { width: min(560px, 92vw); }
-/* ── 注入笔记选择（文件树） ── */
+/* 鈹€鈹€ 娉ㄥ叆绗旇閫夋嫨锛堟枃浠舵爲锛?鈹€鈹€ */
 .bridge-tree-modal { width: min(520px, 92vw); }
 .bridge-tree { max-height: 62vh; overflow-y: auto; font-size: 13px; padding: 4px 0; }
 .bridge-tree-row { display: flex; align-items: center; gap: 6px; padding: 3px 6px; border-radius: 4px; cursor: pointer; }
@@ -131,14 +131,14 @@
 .bridge-tree-file { color: var(--text-muted); }
 .bridge-tree-file.is-selected { background: var(--background-modifier-hover); color: var(--text-normal); }
 .bridge-tree-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-/* ── 侧栏档位 ── */
+/* 鈹€鈹€ 渚ф爮妗ｄ綅 鈹€鈹€ */
 .bridge-level-row { display: flex; align-items: center; gap: 8px; }
 .bridge-level-label { font-size: 12px; color: var(--text-muted); }
 .bridge-level-select { font-size: 12px; flex: 1; }
 .bridge-level-btn { font-weight: 600; }
 .bridge-level-btn:disabled { opacity: .5; }
 
-/* ── 已注入行 + 清除 ── */
+/* 鈹€鈹€ 宸叉敞鍏ヨ + 娓呴櫎 鈹€鈹€ */
 .bridge-injected-row { display: flex; align-items: center; gap: 6px; }
 .bridge-injected-x {
   font-size: 14px; line-height: 1; padding: 0 6px;
@@ -146,12 +146,12 @@
   color: var(--text-muted); border-radius: 4px;
 }
 .bridge-injected-x:hover { color: var(--text-error); background: var(--background-modifier-hover); }
-/* ── 已注入（多篇） ── */
+/* 鈹€鈹€ 宸叉敞鍏ワ紙澶氱瘒锛?鈹€鈹€ */
 .bridge-injected-list { display: flex; flex-direction: column; gap: 4px; }
 .bridge-injected-item { display: flex; align-items: center; gap: 6px; }
 .bridge-injected-name { flex: 1; font-size: 12px; color: var(--text-muted); }
 .bridge-injected-clearall { align-self: flex-start; font-size: 11px; padding: 2px 6px; }
-/* 发送模式切换：默认排队，点亮「打断」= steer（插进当前这一轮） */
+/* 鍙戦€佹ā寮忓垏鎹細榛樿鎺掗槦锛岀偣浜€屾墦鏂€? steer锛堟彃杩涘綋鍓嶈繖涓€杞級 */
 .bridge-chat-steer {
   align-self: flex-end;
   margin-right: 6px;
@@ -170,6 +170,71 @@
   border-color: var(--interactive-accent);
 }
 
-/* 工作区下「新建会话」那行：跟会话条目区分开 */
+/* 宸ヤ綔鍖轰笅銆屾柊寤轰細璇濄€嶉偅琛岋細璺熶細璇濇潯鐩尯鍒嗗紑 */
 .bridge-tree-new .bridge-tree-name { color: var(--text-accent); }
 .bridge-tree-new:hover { background: var(--background-modifier-hover); }
+
+/* 合并盒里还没发出去的：虚线 + 半透明，和已发出的区分开 */
+.bridge-msg-pending {
+  opacity: 0.62;
+  border: 1px dashed var(--background-modifier-border);
+  background: transparent;
+}
+/* 标记：只在屏幕上画，不改文件。
+   点标记 = 字缝里的工字形；范围 = 两端工字形 + 中间底色
+
+   整个工字是「一个元素 + 三个背景渐变」画出来的：
+     一竖（居中细条） + 上横（顶部粗条） + 下横（底部粗条）
+   然后整块用 translate(-50%,-50%) 做中心对齐 —— 不再让两半各自定位，
+   上下伸出自然对称，不会出现一头顶破、一头空一截。
+
+   中心高度取 -0.35em：中文字身大致从基线往上 0.88em 到往下 0.12em，
+   字身中心就在基线上方约 0.35em。
+
+   尺寸全用 em，字号变了跟得上；线宽有 px 下限，小字号也看得见。
+   一圈背景色 drop-shadow，深色主题下不和笔画黏成一团。 */
+.bridge-mark-beam {
+  display: inline-block;
+  width: 0;
+  height: 0;
+  position: relative;
+  pointer-events: none;
+  vertical-align: baseline;
+}
+
+.bridge-mark-beam::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  /* -0.35em = 字身中心；再 translate(-50%,-50%) 让整块的「中心」压在这个点上 */
+  top: -0.35em;
+  width: 1em;          /* 两端总宽 = 一个字，左右各半个字 */
+  height: 1.32em;      /* 比字身高，上下各伸出一截 */
+  transform: translate(-50%, -50%);
+  background-image: linear-gradient(var(--text-accent), var(--text-accent)),
+    linear-gradient(var(--text-accent), var(--text-accent)),
+    linear-gradient(var(--text-accent), var(--text-accent));
+  background-position: center center, center top, center bottom;
+  background-size: max(1px, 0.06em) 100%, 100% max(2px, 0.1em), 100% max(2px, 0.1em);
+  background-repeat: no-repeat;
+  filter: drop-shadow(0 0 1.5px var(--background-primary));
+}
+
+/* 范围标记的中间底色（两端各有一个工字） */
+.bridge-mark-range {
+  background: color-mix(in srgb, var(--text-accent) 20%, transparent);
+  border-radius: 1px;
+}
+
+/* 快捷键行：和原生设置项对齐 */
+.bridge-hotkey-host .setting-item { border-top: none; }
+
+/* 快捷键录制弹窗里的实时回显 */
+.bridge-hotkey-live {
+  font-family: var(--font-monospace);
+  font-size: 1.1em;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: var(--background-modifier-form-field);
+  color: var(--text-accent);
+}
