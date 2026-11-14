@@ -133,7 +133,7 @@ test('toSelection 缺字段时不编位置，直接给 null', () => {
   assert.equal(toSelection({ from: { line: 1, ch: 0 } }), null);
 });
 
-test('editorState 带回 focused 与转好的选区', async (t) => {
+test('editorState 带回转好的选区', async (t) => {
   const bridge = await fakeBridge(() => ({
     ok: true,
     data: {
@@ -150,7 +150,6 @@ test('editorState 带回 focused 与转好的选区', async (t) => {
   const probe = createObsidianProbe({ infoFile: tempInfo(bridge.port) });
   const live = await probe.editorState();
 
-  assert.equal(live.data.focused, false);
   assert.deepEqual(live.data.selection, {
     fromLine: 7,
     fromCh: 0,

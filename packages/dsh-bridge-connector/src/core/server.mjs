@@ -203,8 +203,6 @@ export function startConnector(options) {
       // 客户端明确说过「没有选区」才记为 true；没说过就当不知道
       checked: payload.checked === true,
       heading: asText(payload.heading, 200),
-      // 焦点在不在编辑器里：客户端说 false 才算 false，没说过就当在（旧客户端不发这个）
-      focused: payload.focused === false ? false : true,
       // 另外还开着哪几篇：只留路径字符串，最多 8 条
       others: Array.isArray(payload.others)
         ? payload.others.filter((x) => typeof x === 'string' && x).slice(0, 8)

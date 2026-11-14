@@ -21,6 +21,7 @@ const EXPECTED_TIERS = {
   'obsidian.editor.insert': 'write',
   'obsidian.editor.replace': 'write',
   'obsidian.editor.cursor': 'write',
+  'obsidian.editor.aiCursor': 'write',
   'obsidian.workspace.state': 'read',
   'obsidian.workspace.open': 'write',
   'obsidian.workspace.tab': 'write',

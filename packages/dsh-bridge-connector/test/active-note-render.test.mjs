@@ -128,26 +128,6 @@ test('没有打开的笔记也说一声', () => {
 });
 
 
-// ── 焦点跑了之后：说的是「最后停在哪」，不是「现在在哪」 ──
-test('焦点不在编辑器时，措辞改成「最后停在那」，并说明原因', () => {
-  const text = renderActiveNote({
-    path: 'a.md',
-    lineCount: 100,
-    cursor: { line: 49, ch: 2 },
-    focused: false,
-    checked: true,
-  });
-  assert.match(text, /光标最后处在第 50 行/);
-  assert.match(text, /焦点不在编辑器里/);
-});
-
-test('焦点在编辑器里就用现在时，不要多余的解释', () => {
-  const text = renderActiveNote({ path: 'a.md', cursor: { line: 0, ch: 0 }, focused: true });
-  assert.match(text, /光标在第 1 行/);
-  assert.doesNotMatch(text, /最后处在/);
-  assert.doesNotMatch(text, /焦点不在编辑器里/);
-});
-
 test('另外还开着的笔记会列出来，让他知道还有别的参考物', () => {
   const text = renderActiveNote({ path: 'a.md', cursor: { line: 0, ch: 0 }, others: ['b.md', 'c.md'] });
   assert.match(text, /另外开着：b\.md、c\.md/);
@@ -156,17 +136,8 @@ test('另外还开着的笔记会列出来，让他知道还有别的参考物',
 test('没有别的笔记时就不提这一句', () => {
   const text = renderActiveNote({ path: 'a.md', cursor: { line: 0, ch: 0 }, others: [] });
   assert.doesNotMatch(text, /另外开着/);
-});
-
-test('光标行也遵守同一套措辞', () => {
-  const line = renderCursorLine({ path: 'a.md', cursor: { line: 9, ch: 0 }, focused: false, checked: true });
-  assert.match(line, /最后处在第 10 行/);
-  assert.match(line, /焦点不在编辑器里/);
-});
-
-test('光标行在焦点正常时不加那句', () => {
+});test('光标行在焦点正常时不加那句', () => {
   const line = renderCursorLine({ path: 'a.md', cursor: { line: 9, ch: 0 }, focused: true, checked: true });
-  assert.doesNotMatch(line, /焦点不在编辑器里/);
   assert.doesNotMatch(line, /最后处在/);
 });
 

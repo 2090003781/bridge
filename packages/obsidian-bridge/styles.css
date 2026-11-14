@@ -51,19 +51,13 @@
 .bridge-msg-streaming {
   opacity: 0.85;
 }
-.bridge-chat-input {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
+
 .bridge-chat-textarea {
   width: 100%;
   resize: vertical;
   font-family: inherit;
 }
-.bridge-chat-send {
-  align-self: flex-end;
-}
+
 /* 鈹€鈹€ Bridge 鏃ュ織瑙嗗浘 鈹€鈹€ */
 .bridge-log { display: flex; flex-direction: column; height: 100%; gap: 6px; padding: 8px; }
 .bridge-log-bar { display: flex; gap: 6px; align-items: center; }
@@ -151,24 +145,9 @@
 .bridge-injected-item { display: flex; align-items: center; gap: 6px; }
 .bridge-injected-name { flex: 1; font-size: 12px; color: var(--text-muted); }
 .bridge-injected-clearall { align-self: flex-start; font-size: 11px; padding: 2px 6px; }
-/* 鍙戦€佹ā寮忓垏鎹細榛樿鎺掗槦锛岀偣浜€屾墦鏂€? steer锛堟彃杩涘綋鍓嶈繖涓€杞級 */
-.bridge-chat-steer {
-  align-self: flex-end;
-  margin-right: 6px;
-  padding: 4px 10px;
-  font-size: 12px;
-  border-radius: 6px;
-  border: 1px solid var(--background-modifier-border);
-  background: transparent;
-  color: var(--text-muted);
-  cursor: pointer;
-}
-.bridge-chat-steer:hover { background: var(--background-modifier-hover); }
-.bridge-chat-steer.is-on {
-  background: var(--interactive-accent);
-  color: var(--text-on-accent);
-  border-color: var(--interactive-accent);
-}
+
+
+
 
 /* 宸ヤ綔鍖轰笅銆屾柊寤轰細璇濄€嶉偅琛岋細璺熶細璇濇潯鐩尯鍒嗗紑 */
 .bridge-tree-new .bridge-tree-name { color: var(--text-accent); }
@@ -237,4 +216,116 @@
   border-radius: 6px;
   background: var(--background-modifier-form-field);
   color: var(--text-accent);
+}
+
+/* AI 编辑完成提示：状态栏一小块，最多两条，新的挤掉旧的 */
+.bridge-ai-status {
+  color: var(--text-muted);
+  font-size: 0.9em;
+}
+
+/* 对话列表：容器要定位，回底按钮才能飘在右下 */
+.bridge-panel-chat {
+  position: relative;
+}
+
+/* AI 的消息条：浅黄底，和主人自己的消息分开看 */
+.bridge-msg-assistant {
+  background: color-mix(in srgb, #f0c419 14%, transparent);
+  border-left: 3px solid color-mix(in srgb, #f0c419 55%, transparent);
+  border-radius: 4px;
+  padding: 6px 10px;
+}
+.bridge-msg-assistant.bridge-msg-streaming {
+  background: color-mix(in srgb, #f0c419 9%, transparent);
+}
+
+/* 输入区：输入框和底部工具条做成一个整体（一个圆角框包住） */
+.bridge-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  background: var(--background-primary);
+}
+.bridge-composer:focus-within {
+  border-color: var(--interactive-accent);
+}
+
+/* 输入框本身去掉边框：它已经在 composer 里了，再加一层框就双层了 */
+.bridge-composer .bridge-chat-textarea {
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  resize: none;
+  padding: 2px 2px 4px;
+  width: 100%;
+  min-height: 52px;
+}
+.bridge-composer .bridge-chat-textarea:focus {
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
+/* 工具条：靠右一排 */
+.bridge-composer-bar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.bridge-composer-btn {
+  height: 26px;
+  padding: 0 10px;
+  font-size: 0.85em;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.bridge-composer-btn:hover {
+  color: var(--text-normal);
+  background: var(--background-modifier-hover);
+}
+
+/* 回到底部：圆形小按钮，不可用时变灰但仍占位置（不跳） */
+.bridge-composer-btn.bridge-jump-bottom {
+  width: 26px;
+  padding: 0;
+  border-radius: 50%;
+  font-size: 1em;
+}
+.bridge-composer-btn.bridge-jump-bottom.is-disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* 打断：开着的时候整颗按钮变强调色，一眼能看出当前是插队模式 */
+.bridge-composer-btn.bridge-chat-steer.is-on {
+  color: var(--text-on-accent);
+  background: var(--interactive-accent);
+  border-color: var(--interactive-accent);
+  font-weight: 600;
+}
+.bridge-composer-btn.bridge-chat-steer.is-on:hover {
+  background: var(--interactive-accent-hover);
+  color: var(--text-on-accent);
+}
+
+/* 发送：主按钮 */
+.bridge-composer-btn.bridge-chat-send {
+  color: var(--text-on-accent);
+  background: var(--interactive-accent);
+  border-color: var(--interactive-accent);
+  font-weight: 600;
+}
+.bridge-composer-btn.bridge-chat-send:hover {
+  background: var(--interactive-accent-hover);
+  color: var(--text-on-accent);
 }

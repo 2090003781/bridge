@@ -4,7 +4,7 @@
 // 每轮都要重发一遍，既贵、又把真正要说的话挤掉；而且模型拿到的是一份
 // 可能已经过期的副本，比「知道它在哪、自己去读」更容易出错。
 //
-// 这里回答四件事：当前窗口是哪一篇、多大、光标最后停在哪、那一节叫什么。
+// 这里回答四件事：当前窗口是哪一篇、多大、光标在哪、那一节叫什么。
 // 措辞按「简洁到能一眼扫完」为准——这些东西每轮都要占提示词。
 
 const MAX_SELECTION_PREVIEW = 240;
@@ -29,11 +29,11 @@ const humanLine = (n) => (Number.isFinite(n) ? Number(n) + 1 : null);
 
 const shortName = (note) => cut(note.title || note.path, 60);
 
-/** 光标那一句：焦点在编辑器里说「在」，不在说「最后处在」。 */
+/** 光标那一句：直接说在第几行第几列。 */
 function cursorPhrase(note, withPrefix = true) {
   const cursor = note.cursor;
   if (!cursor || !Number.isFinite(cursor.line)) return '光标位置未知';
-  const where = (note.focused === false ? '最后处在第 ' : '在第 ') + humanLine(cursor.line) + ' 行';
+  const where = '在第 ' + humanLine(cursor.line) + ' 行';
   let out = (withPrefix ? '光标' : '') + where;
   if (Number.isFinite(cursor.ch)) out += '第 ' + (Number(cursor.ch) + 1) + ' 列';
   return out;
@@ -85,7 +85,6 @@ export function renderActiveNote(note) {
 
   let where = cursorPhrase(note);
   if (note.heading) where += '，小节「' + cut(note.heading, MAX_HEADING) + '」';
-  if (note.focused === false) where += '（焦点不在编辑器里）';
   out.push(where);
 
   const sel = selectionPhrase(note);
@@ -118,7 +117,6 @@ export function renderCursorLine(note) {
   if (sel) parts.push(sel);
   const mk = marksPhrase(note);
   if (mk) parts.push(mk);
-  if (note.focused === false) parts.push('焦点不在编辑器里');
 
   return '【光标】' + parts.join(' · ');
 }

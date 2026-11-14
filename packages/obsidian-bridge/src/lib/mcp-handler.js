@@ -53,7 +53,8 @@ const TOOLS = [
   },
   {
     name: 'obsidian_editor_state',
-    description: '当前活跃编辑器的状态：路径 / 光标 / 选区 / 行数',
+    description:
+      '屏幕上那篇笔记的状态：路径 / 光标最后位置 / 选区 / 行数 / 是否在有焦点的编辑器里。焦点跑到别处（比如 Bridge 面板）时也照样返回。',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
@@ -71,15 +72,47 @@ const TOOLS = [
   },
   {
     name: 'obsidian_editor_replace',
-    description: '替换当前选区；给了 from/to 就先选中那个范围再替换（形如 {line,ch}）',
+    description:
+      '替换 AI 自己的选区。两种用法：① 直接带 from/to 指定范围；② 先 obsidian_editor_aiCursor 选一段再调用（不带 from/to）。两种都不会动你的光标。',
     inputSchema: {
       type: 'object',
       properties: {
         text: { type: 'string', description: '替换成什么' },
-        from: { type: 'object', description: '起位置 {line,ch}' },
-        to: { type: 'object', description: '止位置 {line,ch}' },
+        // from/to 必须写全 properties：只写 type:'object' 的话，
+        // 部分 MCP 客户端会当成空对象传过来，参数在客户端就被吞掉了
+        // （表现是「明明给了坐标却报没有选中内容」）。
+        from: {
+          type: 'object',
+          description: '起位置',
+          properties: { line: { type: 'integer', description: '行，0 起' }, ch: { type: 'integer', description: '列，0 起' } },
+          required: ['line'],
+          additionalProperties: false,
+        },
+        to: {
+          type: 'object',
+          description: '止位置',
+          properties: { line: { type: 'integer', description: '行，0 起' }, ch: { type: 'integer', description: '列，0 起' } },
+          required: ['line'],
+          additionalProperties: false,
+        },
       },
       required: ['text'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'obsidian_editor_aiCursor',
+    description:
+      'AI 自己的光标与选区：读位置、移动、选中一段、收起选区。完全不碰用户的光标。插入/替换前通常要先用它指定位置。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '库内路径；省略则取屏幕上那篇' },
+        line: { type: 'integer', description: '移动光标到这一行（0 起）' },
+        ch: { type: 'integer', description: '列（0 起）' },
+        select: { type: 'object', description: '选中一段 {from:{line,ch}, to:{line,ch}}' },
+        collapse: { type: 'boolean', description: 'true = 取消选区，只留插入点' },
+      },
       additionalProperties: false,
     },
   },
@@ -191,10 +224,15 @@ function createMcpHandler({ callCore, listOps, serverVersion = '0.1.0' } = {}) {
       if (typeof (args && args.text) !== 'string') return badArgs('缺少 text');
       return simple('obsidian.editor.replace', pick(args, ['text', 'from', 'to']));
     }
+    if (name === 'obsidian_editor_aiCursor') {
+      return simple('obsidian.editor.aiCursor', pick(args, ['path', 'line', 'ch', 'select', 'collapse']));
+    }
     if (name === 'obsidian_editor_cursor') {
       if (!Number.isInteger(args && args.line)) return badArgs('缺少 line（整数）');
       return simple('obsidian.editor.cursor', pick(args, ['line', 'ch']));
     }
+    // 不依赖编辑器焦点的写入：按 path + 行号范围改文件。
+    // 主人在 Bridge 面板打字时 editor.* 会 no-active-editor，这条路随时可用。
     if (name === 'obsidian_workspace_state') return simple('obsidian.workspace.state', {});
     if (name === 'obsidian_workspace_open') {
       const path = String((args && args.path) || '').trim();

@@ -10,6 +10,211 @@ function __req(id) {
   return m.exports;
 }
 
+__define('lib/ai-cursor-sync.js', function (module, exports, require) {
+'use strict';
+// Bridge · 让 AI 光标跟着文字走
+//
+// 主人改文档（插入、删除、换行）之后，AI 光标原来那个 {line,ch} 就指到别处去了。
+// 这里在每次文档变化时把 AI 光标映射到新坐标上，让它继续贴着原来那段字。
+//
+// 关键：AI 自己的改动要跳过映射。AI 改完已经自己算准了新位置，
+// 如果同步器再映射一次，就会多挪一截（双重移动）。
+// 用 transaction annotation 区分「谁改的」。
+
+let cmCache = null;
+function loadCm() {
+  if (cmCache) return cmCache;
+  const view = require('@codemirror/view');
+  const state = require('@codemirror/state');
+  if (!view || !view.ViewPlugin || !state || !state.Annotation) {
+    throw new Error('宿主没有暴露 CodeMirror 的 ViewPlugin/Annotation');
+  }
+  cmCache = { ViewPlugin: view.ViewPlugin, Annotation: state.Annotation };
+  return cmCache;
+}
+
+/** 打上这个标记的 transaction 表示「这次是 AI 改的，别映射」 */
+let aiEditAnnotation = null;
+
+function getAiEditAnnotation() {
+  if (!aiEditAnnotation) {
+    const { Annotation } = loadCm();
+    aiEditAnnotation = Annotation.define();
+  }
+  return aiEditAnnotation;
+}
+
+/**
+ * 这次文档变化该不该让 AI 光标跟着映射？
+ * 只有当变化里没有「AI 自己改的」标记时才映射——否则 AI 刚算准的位置会被再挪一次。
+ * 抽成纯函数是为了能单测：ViewPlugin 本体依赖 CodeMirror，本机没有那个包。
+ */
+function shouldMapThrough(update, aiEditAnnotation) {
+  if (!update || update.docChanged !== true) return false;
+  for (const tr of update.transactions || []) {
+    if (tr && typeof tr.annotation === 'function' && tr.annotation(aiEditAnnotation)) return false;
+  }
+  return true;
+}
+
+/**
+ * @param {{getAiCursor:()=>any, resolvePath:(cmView:any)=>string|null}} deps
+ */
+function createAiCursorSync({ getAiCursor, resolvePath }) {
+  const { ViewPlugin } = loadCm();
+  const aiEdit = getAiEditAnnotation();
+
+  const plugin = ViewPlugin.fromClass(
+    class {
+      update(u) {
+        if (!shouldMapThrough(u, aiEdit)) return;
+        let cur = null;
+        try {
+          cur = getAiCursor();
+        } catch {
+          cur = null;
+        }
+        if (!cur || typeof cur.mapThrough !== 'function') return;
+        let path = null;
+        try {
+          path = resolvePath(u.view);
+        } catch {
+          path = null;
+        }
+        if (!path) return;
+        cur.mapThrough(path, u.startState.doc, u.changes, u.state.doc, 'after');
+      }
+    },
+  );
+  return [plugin];
+}
+
+module.exports = { createAiCursorSync, getAiEditAnnotation, shouldMapThrough };
+
+});
+__define('lib/ai-cursor.js', function (module, exports, require) {
+'use strict';
+// Bridge · AI 自己的光标
+//
+// 主人有一个光标，AI 需要一个自己的：位置、选区、能往里插字、能选中一段。
+// 但它和主人的那个**完全隔离**：
+//   · 不读主人的光标（所以主人把光标停在哪都不影响 AI 的判断）
+//   · 不动主人的光标（改动走 CM6 的 changes，不发 selection）
+//   · 不显示（纯状态，没有任何装饰）
+//
+// 光标按文件归属：AI 在 A 篇操作完又去 B 篇，B 篇的光标从行首开始，
+// 不会把 A 篇的位置硬套过去。
+
+/** 位置比较：先比行，再比列。 */
+function comparePos(a, b) {
+  if (a.line !== b.line) return a.line - b.line;
+  return (a.ch || 0) - (b.ch || 0);
+}
+
+const norm = (p) => ({
+  line: Math.max(0, Math.floor(Number(p && p.line) || 0)),
+  ch: Math.max(0, Math.floor(Number(p && p.ch) || 0)),
+});
+
+function createAiCursor() {
+  const state = { path: null, head: norm({}), anchor: null };
+
+  /** 取某篇的 AI 光标；换了一篇就从行首重来，不继承上一篇的位置。 */
+  function forPath(path) {
+    if (state.path !== path) {
+      state.path = path;
+      state.head = norm({});
+      state.anchor = null;
+    }
+    return state;
+  }
+
+  /** 移动光标（同时清掉选区，和真实光标的语义一致）。 */
+  function move(path, pos) {
+    const st = forPath(path);
+    st.head = norm(pos);
+    st.anchor = null;
+    return snapshot(st);
+  }
+
+  /** 选中一段：anchor 是起点，head 是终点（可以是反向选，from/to 会摆正）。 */
+  function select(path, from, to) {
+    const st = forPath(path);
+    st.anchor = norm(from);
+    st.head = norm(to);
+    return snapshot(st);
+  }
+
+  /** 取消选区，只留插入点。 */
+  function collapse(path) {
+    const st = forPath(path);
+    st.anchor = null;
+    return snapshot(st);
+  }
+
+  /** 当前范围：from / to 已摆正，empty 表示没选中东西。 */
+  function range(path) {
+    const st = forPath(path);
+    if (!st.anchor) return { from: st.head, to: st.head, empty: true };
+    const a = st.anchor;
+    const b = st.head;
+    return comparePos(a, b) <= 0
+      ? { from: a, to: b, empty: a.line === b.line && a.ch === b.ch }
+      : { from: b, to: a, empty: a.line === b.line && a.ch === b.ch };
+  }
+
+  /**
+   * 别人改了文档后，把自己的位置映射到新坐标上 —— 这样文字挪动时
+   * 光标仍然贴着原来那段字，不会莫名其妙落在别的字中间。
+   *
+   * @param {string} path      当前编辑的是哪一篇（不是这一篇就不动）
+   * @param {object} startDoc  改动前的文档（用来把 line/ch 转 offset）
+   * @param {object} changes   CM6 ChangeSet
+   * @param {object} newDoc    改动后的文档（用来把 offset 转回 line/ch）
+   * @param {'before'|'after'|'nearest'} assoc 位置正好落在改动边界上时往哪边靠
+   */
+  function mapThrough(path, startDoc, changes, newDoc, assoc = 'after') {
+    if (state.path !== path) return false;
+    if (!startDoc || !changes || !newDoc) return false;
+
+    const toOffset = (doc, pos) => {
+      const n = Math.min(Math.max(1, Math.floor(pos.line) + 1), doc.lines);
+      const l = doc.line(n);
+      return Math.min(l.from + Math.max(0, Math.floor(pos.ch || 0)), l.to);
+    };
+    const toPos = (doc, offset) => {
+      const at = Math.max(0, Math.min(offset, doc.length));
+      const l = doc.lineAt(at);
+      return { line: l.number - 1, ch: at - l.from };
+    };
+
+    // assoc: 1 = 右偏（改动插在我前面时我往后让），-1 = 左偏
+    const bias = assoc === 'before' ? -1 : 1;
+    const nextHead = toPos(newDoc, changes.mapPos(toOffset(startDoc, state.head), bias));
+    const nextAnchor = state.anchor
+      ? toPos(newDoc, changes.mapPos(toOffset(startDoc, state.anchor), bias))
+      : null;
+
+    state.head = nextHead;
+    state.anchor = nextAnchor;
+    return true;
+  }
+
+  function snapshot(st = state) {
+    return {
+      path: st.path,
+      head: { ...st.head },
+      anchor: st.anchor ? { ...st.anchor } : null,
+      selection: st.anchor ? range(st.path) : null,
+    };
+  }
+
+  return { state, forPath, move, select, collapse, range, snapshot, mapThrough };
+}
+
+module.exports = { createAiCursor };
+
+});
 __define('lib/chat-view.js', function (module, exports, require) {
 'use strict';
 // Bridge · 主面板（整合视图）
@@ -20,6 +225,7 @@ const fs = require('node:fs');
 const { parseLedger } = __req('lib/ledger-reader.js');
 const { reconcileInjection } = __req('lib/settings.js');
 const { pickMissingReply, shouldReconcile } = __req('lib/reply-reconcile.js');
+const { pickReplyAnchor } = __req('lib/scroll-anchor.js');
 
 const VIEW_TYPE = 'bridge-chat';
 const RECENT_LIMIT = 15;
@@ -79,6 +285,7 @@ class BridgeChatView extends ItemView {
 
   onClose() {
     if (this.pendingTimer) { clearTimeout(this.pendingTimer); this.pendingTimer = null; }
+    if (this._lineTimer) { clearInterval(this._lineTimer); this._lineTimer = null; }
     // 用户主动关掉面板：下次启动别再自己弹出来
     this.plugin.settings.chatOpen = false;
     this.plugin.persistSettings();
@@ -171,21 +378,39 @@ class BridgeChatView extends ItemView {
     this.metaEl = root.createDiv({ cls: 'bridge-meta', text: '' });
 
     this.listEl = root.createDiv({ cls: 'bridge-chat-list' });
+    // 是否贴着底部，由「用户自己的滚动」决定，而不是每次重建后再算一遍——
+    // 重建那一刻 scrollHeight 还没稳定，算出来的值经常是错的，于是又把人拽到底下。
+    this._stickToBottom = true;
+    this.listEl.addEventListener('scroll', () => {
+      this._stickToBottom = this.isAtBottom();
+      this.updateJumpButton();
+    });
 
-    const inputWrap = root.createDiv({ cls: 'bridge-chat-input' });
+    // 输入区做成一个整体：上面是输入框，下面一条工具条，靠右排「回底 / 打断 / 发送」
+    const inputWrap = root.createDiv({ cls: 'bridge-composer' });
     this.inputEl = inputWrap.createEl('textarea', {
       cls: 'bridge-chat-textarea',
       attr: { placeholder: '跟 DSH 说点什么…（Enter 发送，Shift+Enter 换行）', rows: '3' },
     });
+    const bar = inputWrap.createDiv({ cls: 'bridge-composer-bar' });
+
+    // 回到底部：一开始禁用，往上翻历史时才亮起来
+    this.jumpEl = bar.createEl('button', { cls: 'bridge-composer-btn bridge-jump-bottom', text: '↓' });
+    this.jumpEl.title = '回到最底下';
+    this.jumpEl.onClickEvent(() => {
+      this.scrollToBottom();
+      this.updateJumpButton();
+    });
+
     // queue = 排队等这一轮结束；steer = 立刻打断当前这一轮
-    this.steerBtn = inputWrap.createEl('button', { cls: 'bridge-chat-steer', text: '打断' });
+    this.steerBtn = bar.createEl('button', { cls: 'bridge-composer-btn bridge-chat-steer', text: '打断' });
     this.steerBtn.title = '默认排队（等这一轮结束）。点亮「打断」则立刻插进当前这一轮。';
     this.steerBtn.onClickEvent(() => {
       this.steerMode = !this.steerMode;
       this.steerBtn.toggleClass('is-on', this.steerMode);
       new Notice(this.steerMode ? '发送模式：打断当前一轮' : '发送模式：排队等待');
     });
-    this.sendBtn = inputWrap.createEl('button', { cls: 'bridge-chat-send', text: '发送' });
+    this.sendBtn = bar.createEl('button', { cls: 'bridge-composer-btn bridge-chat-send', text: '发送' });
     this.sendBtn.onClickEvent(() => this.send());
     this.inputEl.addEventListener('keydown', (ev) => {
       if (ev.key === 'Enter' && !ev.shiftKey) {
@@ -387,8 +612,10 @@ class BridgeChatView extends ItemView {
       const text = Array.isArray(content)
         ? content.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('')
         : '';
+      // 按行排队吐出来：一次全出现会让人分不清「刚出来的」和「早就在那儿的」
       if (text) {
-        this.assistantBuffer += text;
+        this.assistantBuffer = (this.assistantBuffer || '') + text;
+        this._renderAnchor = 'reply';
         this.render();
       }
       return;
@@ -399,6 +626,7 @@ class BridgeChatView extends ItemView {
       if (this.assistantBuffer) {
         this.messages.push({ role: 'assistant', text: this.assistantBuffer });
         this.assistantBuffer = '';
+        this._renderAnchor = 'reply';
       }
       this.render();
       this.setStatus('就绪');
@@ -449,6 +677,8 @@ class BridgeChatView extends ItemView {
   async deliver(parts, isSteer) {
     const text = parts.join('\n');
     this.messages.push({ role: 'user', text });
+    // 自己刚发了话，理应跟到底部看回复
+    this._stickToBottom = true;
     this.render();
     this.setStatus(isSteer ? '发送中…' : '排队中…');
     const res = await this.plugin.connector().sendTask({
@@ -600,8 +830,99 @@ class BridgeChatView extends ItemView {
     }
   }
 
+  // 是否已经贴在最底下（往上翻看历史时不该被拽回来）
+  isAtBottom() {
+    const el = this.listEl;
+    if (!el) return true;
+    return el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  }
+
+  scrollToBottom() {
+    const el = this.listEl;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }
+
+  // 元素相对列表内容的位置和高度。用 rect 差值算，不受 offsetParent 影响。
+  rectInList(node) {
+    const el = this.listEl;
+    if (!el || !node) return null;
+    const nr = node.getBoundingClientRect();
+    const er = el.getBoundingClientRect();
+    return { top: nr.top - er.top + el.scrollTop, height: nr.height };
+  }
+
+  // 一行有多高：优先用计算样式；拿到 "normal" 就按字号估。
+  lineHeightOf(node) {
+    try {
+      const cs = window.getComputedStyle(node);
+      const lh = parseFloat(cs.lineHeight);
+      if (Number.isFinite(lh) && lh > 0) return lh;
+      const fs = parseFloat(cs.fontSize);
+      if (Number.isFinite(fs) && fs > 0) return fs * 1.6;
+    } catch {
+      /* 拿不到就算了，锚点会退回气泡底部 */
+    }
+    return null;
+  }
+
+  // 让最后一条 AI 回复紧贴着我说的那句话出现：
+  // 短消息从它顶部看起，长消息只留最后两行——回复的开头始终紧接在下面。
+  // 具体算法见 scroll-anchor.js。
+  scrollToReplyAnchor() {
+    const el = this.listEl;
+    if (!el) return;
+    const kids = Array.from(el.children || []);
+    let assistantTop = null;
+    let userNode = null;
+    let seenReply = false;
+    for (let i = kids.length - 1; i >= 0; i -= 1) {
+      const node = kids[i];
+      if (!node.classList) continue;
+      if (!seenReply) {
+        if (node.classList.contains('bridge-msg-assistant')) {
+          assistantTop = this.rectInList(node)?.top ?? null;
+          seenReply = true;
+        }
+        continue;
+      }
+      // 回复上面最近的那句我说的话（待发气泡在回复后面，不会走到这里）
+      if (node.classList.contains('bridge-msg-user')) {
+        userNode = node;
+        break;
+      }
+    }
+    const userRect = userNode ? this.rectInList(userNode) : null;
+    const target = pickReplyAnchor({
+      userTop: userRect ? userRect.top : null,
+      userHeight: userRect ? userRect.height : null,
+      assistantTop,
+      viewHeight: el.clientHeight,
+      lineHeight: userNode ? this.lineHeightOf(userNode) : null,
+    });
+    // 没有可对齐的回复（比如刚打开会话）：还是滚到底
+    if (target === null) {
+      this.scrollToBottom();
+      return;
+    }
+    el.scrollTop = Math.max(0, target);
+  }
+
+  updateJumpButton() {
+    if (!this.jumpEl) return;
+    // 在工具条里，不靠隐藏来腾位置——那样按钮会跳来跳去；
+    // 改成「不可用」：位置固定，只是变灰
+    const away = !this.isAtBottom();
+    this.jumpEl.toggleClass('is-disabled', !away);
+    this.jumpEl.title = away ? '回到最底下' : '已经在最底下了';
+  }
+
   render() {
     if (!this.listEl) return;
+    // 渲染前先记住有没有贴在底部：新消息进来时，
+    // 正在往上翻的人不该被拽到底下，什么也没看清
+    const stick = this._stickToBottom !== false;
+    const keepTop = this.listEl.scrollTop;
     this.listEl.empty();
     for (const msg of this.messages) {
       const el = this.listEl.createDiv({ cls: `bridge-msg bridge-msg-${msg.role}` });
@@ -621,7 +942,16 @@ class BridgeChatView extends ItemView {
         el.setText(text);
       }
     }
-    this.listEl.scrollTop = this.listEl.scrollHeight;
+    if (stick) {
+      // 刚发完自己的话就是要看自己的话（bottom）；
+      // AI 回复进来则停在回复开头（reply），不让长回复把人带到底下。
+      if (this._renderAnchor === 'reply') this.scrollToReplyAnchor();
+      else this.scrollToBottom();
+    } else {
+      this.listEl.scrollTop = keepTop;
+    }
+    this._renderAnchor = 'bottom';
+    this.updateJumpButton();
   }
 }
 
@@ -1170,9 +1500,12 @@ __define('lib/driver.js', function (module, exports, require) {
 // list() 给操作目录；call() 执行一个操作。权限/账本/HTTP 都套在它外面。
 
 const { createRegistry } = __req('lib/registry.js');
+const { createAiCursor } = __req('lib/ai-cursor.js');
 
 function createDriver(deps = {}) {
-  const registry = createRegistry(deps);
+  // AI 光标是 driver 自带的状态：调用方不传就自己建一个，
+  // 这样每个 driver 都有独立的 AI 光标，测试和运行时行为一致。
+  const registry = createRegistry({ ...deps, aiCursor: deps.aiCursor || createAiCursor() });
   return {
     list() {
       return { ops: registry.list() };
@@ -1812,22 +2145,149 @@ function screenEditor(obsidian) {
   if (!ws) return null;
   const active = activeEditor(obsidian);
   if (active && active.file) return { ...active, focused: true };
+
+  // 走主编辑区的 active leaf，而不是 getLeavesOfType 的末位——
+  // 后者把后台标签也算进来，顺序还不是 z 序，可能拿到看不见的那篇。
+  const hits = [];
+  const walk = (node, depth) => {
+    if (!node || depth > 8) return;
+    if (typeof node.getActiveLeaf === 'function') {
+      const leaf = node.getActiveLeaf();
+      const v = leaf && leaf.view;
+      if (v && v.editor && v.file) hits.push(v);
+    }
+    for (const child of node.children || []) walk(child, depth + 1);
+  };
+  try {
+    walk(ws.rootSplit, 0);
+  } catch {
+    /* 布局在重建 */
+  }
+  if (hits[0]) return { view: hits[0], editor: hits[0].editor, file: hits[0].file, focused: false };
+
+  // 兜底：至少还有开着的 markdown
   const leaves = typeof ws.getLeavesOfType === 'function' ? ws.getLeavesOfType('markdown') : [];
   for (let i = leaves.length - 1; i >= 0; i -= 1) {
-    const leaf = leaves[i];
-    const view = leaf && leaf.view;
-    if (view && view.editor && view.file) {
-      return { view, editor: view.editor, file: view.file, focused: false };
-    }
+    const v = leaves[i] && leaves[i].view;
+    if (v && v.editor && v.file) return { view: v, editor: v.editor, file: v.file, focused: false };
   }
   return null;
 }
 
-function requireEditor(ctx) {
-  const active = activeEditor(ctx.obsidian);
-  if (!active) throw opError('no-active-editor', '没有打开的 Markdown 编辑器（先在 Obsidian 里打开一篇笔记）');
-  return active;
+// 找某篇笔记对应的 CodeMirror EditorView。
+//
+// 只认「屏幕上最上层那篇」：AI 协同编辑只对主人正在看的那篇生效。
+// 改一篇他看不见的东西（藏在别的标签里、或者压根没打开），出了问题他都不知道；
+// 那种情况该走文件方式（明着告诉他是文件改动），而不是悄悄改编辑器缓冲。
+function viewOfFile(obsidian, filePath) {
+  const top = screenEditor(obsidian);
+  if (!top || !top.file || !top.file.path) return null;
+  if (top.file.path !== filePath) return null;
+  const ed = top.view && top.view.editor;
+  if (!ed || !ed.cm || typeof ed.cm.dispatch !== 'function') return null;
+  return ed.cm;
 }
+
+// 行/列 → 文档 offset。
+// 越界不再静默夹取：改到文末却不报错，是最容易让人以为「改成功了」的坑。
+// 返回 { offset, clipped }，由调用方决定要不要报错。
+function offsetOfPos(doc, pos) {
+  const line = Math.max(0, Math.floor(Number(pos && pos.line) || 0));
+  const ch = Math.max(0, Math.floor(Number(pos && pos.ch) || 0));
+  const clipped = line + 1 > doc.lines;
+  const n = Math.min(line + 1, doc.lines);
+  const l = doc.line(n);
+  const offset = Math.min(l.from + ch, l.to);
+  return { offset, clipped, actual: { line: n - 1, ch: offset - l.from } };
+}
+
+/** 取 offset，越界就报错（不再假装修剪成功）。 */
+function requireOffset(doc, pos, label) {
+  const r = offsetOfPos(doc, pos);
+  if (r.clipped) {
+    throw opError(
+      'bad-args',
+      `${label} 超出了文档范围：这篇只有 ${doc.lines} 行`,
+    );
+  }
+  return r.offset;
+}
+
+/** 目标笔记：给了 path 就用它，没给就用「屏幕上那篇」——editor.* 系列原来就是这么默认的。 */
+function targetPath(ctx, args) {
+  const given = String((args && args.path) || '').trim();
+  if (given) return given;
+  const view = screenEditor(ctx.obsidian);
+  if (view && view.file && view.file.path) return view.file.path;
+  throw opError('bad-args', '缺少 path，而且屏幕上没有打开的笔记');
+}
+
+/** 拿 AI 自己的光标；driver 没给就当没有（降级成只按坐标改）。 */
+function aiCursorOf(ctx) {
+  const cur = ctx && ctx.aiCursor;
+  if (!cur || typeof cur.forPath !== 'function') {
+    throw opError('unsupported', 'AI 光标未初始化（driver 没注入）');
+  }
+  return cur;
+}
+
+/**
+ * 把某篇的编辑器缓冲立刻写盘。
+ * Obsidian 自己也会存，但有延迟（实测改完到文件同步有几秒）。
+ * AI 改完顺手存一下，文件系统那边立刻就能读到新内容，
+ * 省得「Obsidian 门」和「文件本体」两种读法打架。
+ * 存不进去不报错：说明这篇可能没开，那就等 Obsidian 自己存。
+ */
+async function saveDoc(obsidian, filePath) {
+  try {
+    const ws = obsidian && obsidian.workspace;
+    if (!ws || typeof ws.getLeavesOfType !== 'function') return false;
+    for (const leaf of ws.getLeavesOfType('markdown') || []) {
+      const v = leaf && leaf.view;
+      if (!v || !v.file || v.file.path !== filePath) continue;
+      if (typeof v.save !== 'function') continue;
+      await v.save();
+      return true;
+    }
+  } catch {
+    /* 存失败就是还没存，不影响这次改动本身 */
+  }
+  return false;
+}
+
+/** 把「AI 正在改这篇」抛给界面（driver 注入的回调）；没有界面就安静跳过。 */
+function notifyAiEdit(ctx, phase, filePath) {
+  const fn = ctx && ctx.onAiEdit;
+  if (typeof fn !== 'function') return;
+  try {
+    fn(phase, filePath);
+  } catch {
+    /* 界面出问题不该打断写入 */
+  }
+}
+
+/** 改文档时打上「AI 自己改的」标记：光标同步器看到就跳过映射，避免双重移动。 */
+function dispatchAiEdit(view, changes) {
+  let annotations = null;
+  try {
+    const { getAiEditAnnotation } = __req('lib/ai-cursor-sync.js');
+    annotations = getAiEditAnnotation().of(true);
+  } catch {
+    annotations = null;
+  }
+  if (!annotations) {
+    view.dispatch({ changes });
+    return;
+  }
+  view.dispatch({ changes, annotations });
+}
+
+/** 把 AI 光标前进到某个 offset 对应的行列。 */
+function syncAiCursor(cur, filePath, doc, offset) {
+  const line = doc.lineAt(Math.max(0, Math.min(offset, doc.length)));
+  cur.move(filePath, { line: line.number - 1, ch: offset - line.from });
+}
+
 
 const OPS = [
   {
@@ -1918,68 +2378,138 @@ const OPS = [
   {
     id: 'obsidian.editor.insert',
     tier: 'write',
-    summary: '在光标处插入文本（position=end 则追加到文末）；保留撤销栈',
-    run(ctx) {
-      const active = requireEditor(ctx);
+    summary: '在 AI 自己的光标处插入文本（不动你的光标；position=end 追加到文末；改完立刻落盘）',
+    async run(ctx) {
       const text = ctx.args && ctx.args.text;
       if (typeof text !== 'string' || text.length === 0) throw opError('bad-args', '缺少 text');
-      const ed = active.editor;
-      const position = ctx.args.position === 'end' ? 'end' : 'cursor';
-
-      if (position === 'end' && typeof ed.setCursor === 'function' && typeof ed.getLine === 'function') {
-        const last = typeof ed.lastLine === 'function' ? ed.lastLine() : Math.max(0, (ed.lineCount() || 1) - 1);
-        ed.setCursor({ line: last, ch: String(ed.getLine(last) || '').length });
+      const file = resolveFile(ctx, targetPath(ctx, ctx.args));
+      const view = viewOfFile(ctx.obsidian, file.path);
+      if (!view) {
+        throw opError(
+          'no-editor-open',
+          '这一篇不是屏幕上最上层那篇，AI 协同编辑只对那一篇生效。' +
+            '先 obsidian.workspace.open 把它打开并切到最上层；或者用文件方式（obsidian.note.append 等）。',
+        );
       }
+      const cur = aiCursorOf(ctx);
+      const doc = view.state.doc;
 
-      if (typeof ed.replaceSelection === 'function') {
-        ed.replaceSelection(text);
-      } else if (typeof ed.setValue === 'function' && typeof ed.getValue === 'function') {
-        ed.setValue(`${ed.getValue()}${text}`);
+      let at;
+      if (ctx.args.position === 'end') {
+        at = doc.length;
       } else {
-        throw opError('unsupported', '当前编辑器不支持插入');
+        const st = cur.forPath(file.path);
+        // AI 光标是按文件归属的：换了一篇就会重置成 {0,0}。
+        // 这时候直接插会静默写进文首——主人在中途切了笔记就会写错文件。
+        // 所以宁可报错，让他先用 editor.aiCursor 指定位置。
+        if (!st.path || st.path !== file.path || (st.head.line === 0 && st.head.ch === 0 && !st.anchor)) {
+          throw opError(
+            'no-ai-cursor',
+            'AI 光标不在这一篇的指定位置上。先调 editor.aiCursor 设 line/ch（或 position:"end"），' +
+              '否则会写到文首——那几乎一定不是你想要的。',
+          );
+        }
+        at = requireOffset(doc, st.head, 'AI 光标位置');
       }
+
+      // 只发 changes：AI 的字插进去，你的光标按逻辑位置自己维护，不被搬动
+      notifyAiEdit(ctx, 'editing', file.path);
+      dispatchAiEdit(view, { from: at, to: at, insert: text });
+      syncAiCursor(cur, file.path, view.state.doc, at + text.length);
+      // 默认立刻落盘：文件系统那边马上能读到，两种读法不会撞版本
+      const saved = ctx.args.save === false ? false : await saveDoc(ctx.obsidian, file.path);
+      notifyAiEdit(ctx, saved ? 'saved' : 'done', file.path);
 
       return {
         inserted: true,
-        position,
-        cursor: typeof ed.getCursor === 'function' ? ed.getCursor() : null,
+        mode: ctx.args.position === 'end' ? 'end' : 'ai-cursor',
+        at,
+        saved,
+        aiCursor: cur.snapshot(),
       };
     },
   },
   {
     id: 'obsidian.editor.replace',
     tier: 'write',
-    summary: '替换选中内容；给了 from/to 就先选中那个范围再替换',
-    run(ctx) {
-      const active = requireEditor(ctx);
+    summary: '替换 AI 自己选中的范围（不动你的光标和选区）；可用 from/to 先改选；改完立刻落盘',
+    async run(ctx) {
       const text = ctx.args && ctx.args.text;
       if (typeof text !== 'string') throw opError('bad-args', '缺少 text');
-      const ed = active.editor;
-      const from = ctx.args.from;
-      const to = ctx.args.to;
-      const hadRange = Boolean(from && to && typeof ed.setSelection === 'function');
-      if (hadRange) ed.setSelection(from, to);
-      if (typeof ed.replaceSelection !== 'function') throw opError('unsupported', '当前编辑器不支持替换');
-      ed.replaceSelection(text);
-      return { replaced: true, hadRange, target: hadRange ? { from, to } : 'selection' };
+      const file = resolveFile(ctx, targetPath(ctx, ctx.args));
+      const view = viewOfFile(ctx.obsidian, file.path);
+      if (!view) {
+        throw opError(
+          'no-editor-open',
+          '这一篇不是屏幕上最上层那篇，AI 协同编辑只对那一篇生效。' +
+            '先 obsidian.workspace.open 把它打开并切到最上层；或者用文件方式。',
+        );
+      }
+      const cur = aiCursorOf(ctx);
+      const doc = view.state.doc;
+
+      // 给了 from/to 就先把 AI 的选区挪过去（只改 AI 的，不碰你的）
+      if (ctx.args.from && ctx.args.to) cur.select(file.path, ctx.args.from, ctx.args.to);
+      const r = cur.range(file.path);
+
+      const from = requireOffset(doc, r.from, '替换起点');
+      const to = requireOffset(doc, r.to, '替换终点');
+      if (r.empty) {
+        throw opError('empty-selection', 'AI 没有选中任何内容：先 editor.aiCursor 选一段，或者带 from/to');
+      }
+
+      notifyAiEdit(ctx, 'editing', file.path);
+      dispatchAiEdit(view, { from, to, insert: text });
+      syncAiCursor(cur, file.path, view.state.doc, from + text.length);
+      const saved = ctx.args.save === false ? false : await saveDoc(ctx.obsidian, file.path);
+      notifyAiEdit(ctx, saved ? 'saved' : 'done', file.path);
+
+      return { replaced: true, from: r.from, to: r.to, saved, aiCursor: cur.snapshot() };
     },
   },
   {
     id: 'obsidian.editor.cursor',
     tier: 'write',
-    summary: '把光标移到指定行/列，并滚动到可见位置',
+    summary: '移动 AI 自己的光标（不显示、不动你的；之后的 editor.* 都基于它）',
     run(ctx) {
-      const active = requireEditor(ctx);
+      const file = resolveFile(ctx, targetPath(ctx, ctx.args));
+      const cur = aiCursorOf(ctx);
       const line = Number(ctx.args && ctx.args.line);
       if (!Number.isInteger(line) || line < 0) throw opError('bad-args', '缺少合法的 line（0 起）');
       const ch = Number.isInteger(ctx.args.ch) && ctx.args.ch >= 0 ? ctx.args.ch : 0;
-      const ed = active.editor;
-      if (typeof ed.setCursor !== 'function') throw opError('unsupported', '当前编辑器不支持定位');
-      ed.setCursor({ line, ch });
-      if (typeof ed.scrollIntoView === 'function') {
-        ed.scrollIntoView({ from: { line, ch }, to: { line, ch } }, true);
+      const st = cur.move(file.path, { line, ch });
+      return {
+        moved: true,
+        path: file.path,
+        aiCursor: st,
+        note: '移动的是 AI 自己的光标，你的光标没有被移动',
+      };
+    },
+  },
+  {
+    id: 'obsidian.editor.aiCursor',
+    tier: 'write',
+    summary: 'AI 自己的光标：读当前位置，或选一段（select / collapse）。和你的光标完全隔离',
+    run(ctx) {
+      const file = resolveFile(ctx, targetPath(ctx, ctx.args));
+      const cur = aiCursorOf(ctx);
+      const args = ctx.args || {};
+
+      if (args.select && args.select.from && args.select.to) {
+        cur.select(file.path, args.select.from, args.select.to);
+      } else if (args.collapse === true) {
+        cur.collapse(file.path);
+      } else if (Number.isInteger(args.line)) {
+        cur.move(file.path, { line: args.line, ch: args.ch });
       }
-      return { cursor: { line, ch } };
+
+      const st = cur.forPath(file.path);
+      return {
+        path: file.path,
+        aiCursor: st,
+        selection: cur.range(file.path),
+        note: 'AI 的光标/选区，不会和你的互相影响',
+      };
     },
   },
   {
@@ -2630,6 +3160,62 @@ function shouldReconcile({ running, waiting, elapsedMs, timeoutMs = 180000 } = {
 module.exports = { pickMissingReply, shouldReconcile };
 
 });
+__define('lib/scroll-anchor.js', function (module, exports, require) {
+// Bridge · 回复进来时视口停在哪
+//
+// 主人想看的画面是这样：自己那句话在上面，AI 回复的开头紧接着下一行。
+//
+// 短消息：整条都在，停它的顶部，一眼看全。
+// 长消息：整条塞不下，停到它最后两行——尾巴露出来，回复照样紧接在下面，
+//        别为了看开头把回复顶出屏幕。
+
+// 我那句话最多能占视口多少，超过了就只留尾巴
+const ROOM_RATIO = 0.7;
+// 长消息留几行给自己收尾
+const TAIL_LINES = 2;
+
+function num(v) {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+// 返回要滚到的位置（相对列表顶部）；null 表示「没有回复可对齐」，交给调用方滚到底
+function pickReplyAnchor({
+  userTop,
+  userHeight,
+  assistantTop,
+  viewHeight,
+  lineHeight,
+  tailLines = TAIL_LINES,
+} = {}) {
+  const a = num(assistantTop);
+  // 连回复气泡都没有，就没有「回复开头」这回事
+  if (a === null) return null;
+  const u = num(userTop);
+  // 没有我那句（比如会话刚开）：停在回复开头
+  if (u === null) return a;
+  // 顺序反了不硬按，停在我那句上
+  if (a < u) return u;
+
+  const h = num(userHeight);
+  // 高度量不出来：按顶部对齐，别乱猜
+  if (h === null) return u;
+  const vh = num(viewHeight) || 0;
+  // 视口有多高都不知道，就不敢把回复推到看不见的地方
+  if (!vh) return a;
+
+  // 不算长：整条给足，从顶部开始看
+  if (h <= vh * ROOM_RATIO) return u;
+
+  // 太长：只留最后两行，下面紧接着就是回复开头
+  const lh = num(lineHeight);
+  const tail = lh === null ? 0 : lh * (num(tailLines) || 0);
+  // 尾巴比整条还高时夹回顶部，不滚到句子上面去
+  return Math.max(u, u + h - tail);
+}
+
+module.exports = { pickReplyAnchor, ROOM_RATIO, TAIL_LINES };
+
+});
 __define('lib/server.js', function (module, exports, require) {
 'use strict';
 // Bridge · HTTP 入口
@@ -3096,6 +3682,8 @@ const { BridgeLogModal } = __req('lib/log-view.js');
 const { createPluginLog } = __req('lib/plugin-log.js');
 const { createMarkExtension, refreshAllMarkViews } = __req('lib/mark-decoration.js');
 const { nextMarkState, describeMarks, marksForPath } = __req('lib/mark-store.js');
+const { createAiCursor } = __req('lib/ai-cursor.js');
+const { createAiCursorSync } = __req('lib/ai-cursor-sync.js');
 
 const INFO_DIR = path.join(os.homedir(), '.obsidian-bridge');
 const CONNECTOR_FILE = path.join(os.homedir(), '.dsh-bridge', 'connector.json');
@@ -3165,6 +3753,22 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
     // 标记：只在屏幕上画（CodeMirror 装饰），文档一个字节都不动。
     // 装饰层拿不到就降级——标记本身的记录和播报不依赖它，别为了「看得见」
     // 把整个插件搞挂（那样连命令都注册不上）。
+    // AI 自己的光标：位置和选区都存这儿，不显示、不碰主人的
+    this.aiCursor = createAiCursor();
+
+    // 主人改文字时，AI 光标跟着那段字挪，不会落到别的字中间。
+    // 拿不到 CodeMirror 就跳过——光标不跟随只是不够聪明，不该拖垮插件。
+    try {
+      this.registerEditorExtension(
+        createAiCursorSync({
+          getAiCursor: () => this.aiCursor,
+          resolvePath: (cmView) => this.pathOfEditorView(cmView),
+        }),
+      );
+    } catch (err) {
+      this.logEvent('ai-cursor', '跟随同步不可用：' + String((err && err.message) || err));
+    }
+
     this._marks = [];
     this._markVisible = false;
     try {
@@ -3255,6 +3859,45 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
 
   // 当前打开的笔记 —— 推给连接器，agent 那边就能直接读到「屏幕上这一篇」。
   // 内容取编辑器缓冲（getValue），所以还没保存的改动也在里面，这正是要的效果。
+  // AI 每完成一次编辑，在状态栏亮一下「AI 编辑完成」，几秒后自己消失。
+  // 不带文件名、不带时间：主人只要知道「刚才那下是 AI 动的」就够了，
+  // 加东西反而要读。连续操作就把计时器重置，一直是亮着的。
+  onAiEdit(phase) {
+    try {
+      if (phase === 'editing') return; // AI 不是逐字打字，没有「编辑中」这个阶段
+      if (!this.aiStatusEl) {
+        this.aiStatusEl = this.addStatusBarItem();
+        this.aiStatusEl.addClass('bridge-ai-status');
+      }
+      this.aiStatusEl.setText('AI 编辑完成');
+      this.aiStatusEl.style.display = '';
+      if (this._aiNoticeTimer) clearTimeout(this._aiNoticeTimer);
+      this._aiNoticeTimer = setTimeout(() => {
+        this._aiNoticeTimer = null;
+        if (this.aiStatusEl) {
+          this.aiStatusEl.setText('');
+          this.aiStatusEl.style.display = 'none';
+        }
+      }, 1500);
+    } catch {
+      /* 状态栏出问题不该打断写入 */
+    }
+  }
+
+  // 某个 CodeMirror 视图对应哪篇笔记（同步器要用它确认是哪一篇）
+  pathOfEditorView(cmView) {
+    try {
+      const leaves = this.app.workspace.getLeavesOfType('markdown') || [];
+      for (const leaf of leaves) {
+        const v = leaf && leaf.view;
+        if (v && v.editor && v.editor.cm === cmView) return v.file ? v.file.path : null;
+      }
+    } catch {
+      /* 布局在重建 */
+    }
+    return null;
+  }
+
   // 屏幕上那篇笔记（不看焦点）：焦点在面板输入框时 activeLeaf 是面板，
   // 所以要先看活跃编辑器，没有就问布局「哪个 markdown 标签活着」。
   topMarkdownView() {
@@ -3406,11 +4049,11 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
       const activeView = workspace.activeLeaf && workspace.activeLeaf.view;
       // ① 焦点就在编辑器里：最准
       if (isMdView(activeView)) {
-        return { file: activeView.file, editor: activeView.editor, focused: true };
+        return { file: activeView.file, editor: activeView.editor };
       }
       // ② 焦点在面板/侧栏：看主编辑区最上层那篇
       const top = mainMarkdownView();
-      if (top) return { file: top.file, editor: top.editor, focused: false };
+      if (top) return { file: top.file, editor: top.editor };
 
       const leaves =
         typeof workspace.getLeavesOfType === 'function' ? workspace.getLeavesOfType('markdown') : [];
@@ -3419,19 +4062,19 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
         for (const leaf of leaves) {
           const v = leaf && leaf.view;
           if (isMdView(v) && v.file.path === lastPath) {
-            return { file: v.file, editor: v.editor, focused: false };
+            return { file: v.file, editor: v.editor };
           }
         }
       }
       // ④ 兜底：还开着的任意一篇
       for (let i = leaves.length - 1; i >= 0; i -= 1) {
         const v = leaves[i] && leaves[i].view;
-        if (isMdView(v)) return { file: v.file, editor: v.editor, focused: false };
+        if (isMdView(v)) return { file: v.file, editor: v.editor };
       }
       return null;
     };
 
-    const describe = (file, editor, focused) => {
+    const describe = (file, editor) => {
       let text = '';
       try {
         text = editor.getValue();
@@ -3482,8 +4125,6 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
         cursor: cursor ? { line: cursor.line, ch: cursor.ch } : null,
         selection,
         heading: cursor ? headingAt(text, cursor.line) : null,
-        // 焦点在不在编辑器里：不在的时候光标是「最后一次停的位置」，不是实时值
-        focused,
         others: others.slice(0, 8),
         // 当前这篇上的临时标记（最多两个：点 / 范围）
         marks: marksForPath(this._marks, file.path).slice(0, 2),
@@ -3522,7 +4163,7 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
         }
         return;
       }
-      const note = describe(cur.file, cur.editor, cur.focused);
+      const note = describe(cur.file, cur.editor);
       const key = keyOf(note);
       if (!force && key === lastKey) return;
       lastKey = key;
@@ -3720,7 +4361,11 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
       },    });
     this.permissions = permissions;
 
-    const driver = createDriver({ obsidian: this.app });
+    const driver = createDriver({
+      obsidian: this.app,
+      aiCursor: this.aiCursor,
+      onAiEdit: (phase, filePath) => this.onAiEdit(phase, filePath),
+    });
     const ledgerPath = this.ledgerPath();
     const ledger = createLedger({
       sink: (entry) => {
@@ -4105,7 +4750,13 @@ class BridgeSettingTab extends PluginSettingTab {
 
     containerEl.createEl('h3', { text: '操作目录' });
     if (plugin.core) {
-      const driver = createDriver({ obsidian: this.app });
+      // 这里是 SettingTab，this 不是插件：用 plugin.* 才是对的。
+      // 之前写成 this.aiCursor 拿到 undefined，被 driver 的兜底悄悄盖掉了。
+      const driver = createDriver({
+        obsidian: plugin.app,
+        aiCursor: plugin.aiCursor,
+        onAiEdit: (phase, filePath) => plugin.onAiEdit(phase, filePath),
+      });
       for (const op of driver.list().ops) {
         containerEl.createEl('p', {
           text: `${op.id} · ${op.tier} · ${op.summary}`,

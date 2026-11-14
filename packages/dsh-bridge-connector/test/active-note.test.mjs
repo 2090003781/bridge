@@ -208,22 +208,19 @@ test('现查明确说没有打开的笔记，就不带坐标', async (t) => {
   assert.match(text, /没有打开的笔记/);
 });
 
-test('focused 和 others 会被规整保留', async (t) => {
+test('others 会被规整保留', async (t) => {
   const ctx = await boot();
   t.after(() => ctx.server.close());
 
-  await pushNote(ctx, note({ focused: false, others: ['a.md', 'b.md'] }));
-  const live = ctx.server.activeNote();
-  assert.equal(live.focused, false);
-  assert.deepEqual(live.others, ['a.md', 'b.md']);
+  await pushNote(ctx, note({ others: ['a.md', 'b.md'] }));
+  assert.deepEqual(ctx.server.activeNote().others, ['a.md', 'b.md']);
 });
 
-test('旧客户端不发 focused 时当成「焦点在编辑器里」', async (t) => {
+test('没给 others 时是空数组', async (t) => {
   const ctx = await boot();
   t.after(() => ctx.server.close());
 
   await pushNote(ctx, note());
-  assert.equal(ctx.server.activeNote().focused, true);
   assert.deepEqual(ctx.server.activeNote().others, []);
 });
 

@@ -27,22 +27,149 @@ function screenEditor(obsidian) {
   if (!ws) return null;
   const active = activeEditor(obsidian);
   if (active && active.file) return { ...active, focused: true };
+
+  // 走主编辑区的 active leaf，而不是 getLeavesOfType 的末位——
+  // 后者把后台标签也算进来，顺序还不是 z 序，可能拿到看不见的那篇。
+  const hits = [];
+  const walk = (node, depth) => {
+    if (!node || depth > 8) return;
+    if (typeof node.getActiveLeaf === 'function') {
+      const leaf = node.getActiveLeaf();
+      const v = leaf && leaf.view;
+      if (v && v.editor && v.file) hits.push(v);
+    }
+    for (const child of node.children || []) walk(child, depth + 1);
+  };
+  try {
+    walk(ws.rootSplit, 0);
+  } catch {
+    /* 布局在重建 */
+  }
+  if (hits[0]) return { view: hits[0], editor: hits[0].editor, file: hits[0].file, focused: false };
+
+  // 兜底：至少还有开着的 markdown
   const leaves = typeof ws.getLeavesOfType === 'function' ? ws.getLeavesOfType('markdown') : [];
   for (let i = leaves.length - 1; i >= 0; i -= 1) {
-    const leaf = leaves[i];
-    const view = leaf && leaf.view;
-    if (view && view.editor && view.file) {
-      return { view, editor: view.editor, file: view.file, focused: false };
-    }
+    const v = leaves[i] && leaves[i].view;
+    if (v && v.editor && v.file) return { view: v, editor: v.editor, file: v.file, focused: false };
   }
   return null;
 }
 
-function requireEditor(ctx) {
-  const active = activeEditor(ctx.obsidian);
-  if (!active) throw opError('no-active-editor', '没有打开的 Markdown 编辑器（先在 Obsidian 里打开一篇笔记）');
-  return active;
+// 找某篇笔记对应的 CodeMirror EditorView。
+//
+// 只认「屏幕上最上层那篇」：AI 协同编辑只对主人正在看的那篇生效。
+// 改一篇他看不见的东西（藏在别的标签里、或者压根没打开），出了问题他都不知道；
+// 那种情况该走文件方式（明着告诉他是文件改动），而不是悄悄改编辑器缓冲。
+function viewOfFile(obsidian, filePath) {
+  const top = screenEditor(obsidian);
+  if (!top || !top.file || !top.file.path) return null;
+  if (top.file.path !== filePath) return null;
+  const ed = top.view && top.view.editor;
+  if (!ed || !ed.cm || typeof ed.cm.dispatch !== 'function') return null;
+  return ed.cm;
 }
+
+// 行/列 → 文档 offset。
+// 越界不再静默夹取：改到文末却不报错，是最容易让人以为「改成功了」的坑。
+// 返回 { offset, clipped }，由调用方决定要不要报错。
+function offsetOfPos(doc, pos) {
+  const line = Math.max(0, Math.floor(Number(pos && pos.line) || 0));
+  const ch = Math.max(0, Math.floor(Number(pos && pos.ch) || 0));
+  const clipped = line + 1 > doc.lines;
+  const n = Math.min(line + 1, doc.lines);
+  const l = doc.line(n);
+  const offset = Math.min(l.from + ch, l.to);
+  return { offset, clipped, actual: { line: n - 1, ch: offset - l.from } };
+}
+
+/** 取 offset，越界就报错（不再假装修剪成功）。 */
+function requireOffset(doc, pos, label) {
+  const r = offsetOfPos(doc, pos);
+  if (r.clipped) {
+    throw opError(
+      'bad-args',
+      `${label} 超出了文档范围：这篇只有 ${doc.lines} 行`,
+    );
+  }
+  return r.offset;
+}
+
+/** 目标笔记：给了 path 就用它，没给就用「屏幕上那篇」——editor.* 系列原来就是这么默认的。 */
+function targetPath(ctx, args) {
+  const given = String((args && args.path) || '').trim();
+  if (given) return given;
+  const view = screenEditor(ctx.obsidian);
+  if (view && view.file && view.file.path) return view.file.path;
+  throw opError('bad-args', '缺少 path，而且屏幕上没有打开的笔记');
+}
+
+/** 拿 AI 自己的光标；driver 没给就当没有（降级成只按坐标改）。 */
+function aiCursorOf(ctx) {
+  const cur = ctx && ctx.aiCursor;
+  if (!cur || typeof cur.forPath !== 'function') {
+    throw opError('unsupported', 'AI 光标未初始化（driver 没注入）');
+  }
+  return cur;
+}
+
+/**
+ * 把某篇的编辑器缓冲立刻写盘。
+ * Obsidian 自己也会存，但有延迟（实测改完到文件同步有几秒）。
+ * AI 改完顺手存一下，文件系统那边立刻就能读到新内容，
+ * 省得「Obsidian 门」和「文件本体」两种读法打架。
+ * 存不进去不报错：说明这篇可能没开，那就等 Obsidian 自己存。
+ */
+async function saveDoc(obsidian, filePath) {
+  try {
+    const ws = obsidian && obsidian.workspace;
+    if (!ws || typeof ws.getLeavesOfType !== 'function') return false;
+    for (const leaf of ws.getLeavesOfType('markdown') || []) {
+      const v = leaf && leaf.view;
+      if (!v || !v.file || v.file.path !== filePath) continue;
+      if (typeof v.save !== 'function') continue;
+      await v.save();
+      return true;
+    }
+  } catch {
+    /* 存失败就是还没存，不影响这次改动本身 */
+  }
+  return false;
+}
+
+/** 把「AI 正在改这篇」抛给界面（driver 注入的回调）；没有界面就安静跳过。 */
+function notifyAiEdit(ctx, phase, filePath) {
+  const fn = ctx && ctx.onAiEdit;
+  if (typeof fn !== 'function') return;
+  try {
+    fn(phase, filePath);
+  } catch {
+    /* 界面出问题不该打断写入 */
+  }
+}
+
+/** 改文档时打上「AI 自己改的」标记：光标同步器看到就跳过映射，避免双重移动。 */
+function dispatchAiEdit(view, changes) {
+  let annotations = null;
+  try {
+    const { getAiEditAnnotation } = require('./ai-cursor-sync.js');
+    annotations = getAiEditAnnotation().of(true);
+  } catch {
+    annotations = null;
+  }
+  if (!annotations) {
+    view.dispatch({ changes });
+    return;
+  }
+  view.dispatch({ changes, annotations });
+}
+
+/** 把 AI 光标前进到某个 offset 对应的行列。 */
+function syncAiCursor(cur, filePath, doc, offset) {
+  const line = doc.lineAt(Math.max(0, Math.min(offset, doc.length)));
+  cur.move(filePath, { line: line.number - 1, ch: offset - line.from });
+}
+
 
 const OPS = [
   {
@@ -133,68 +260,138 @@ const OPS = [
   {
     id: 'obsidian.editor.insert',
     tier: 'write',
-    summary: '在光标处插入文本（position=end 则追加到文末）；保留撤销栈',
-    run(ctx) {
-      const active = requireEditor(ctx);
+    summary: '在 AI 自己的光标处插入文本（不动你的光标；position=end 追加到文末；改完立刻落盘）',
+    async run(ctx) {
       const text = ctx.args && ctx.args.text;
       if (typeof text !== 'string' || text.length === 0) throw opError('bad-args', '缺少 text');
-      const ed = active.editor;
-      const position = ctx.args.position === 'end' ? 'end' : 'cursor';
-
-      if (position === 'end' && typeof ed.setCursor === 'function' && typeof ed.getLine === 'function') {
-        const last = typeof ed.lastLine === 'function' ? ed.lastLine() : Math.max(0, (ed.lineCount() || 1) - 1);
-        ed.setCursor({ line: last, ch: String(ed.getLine(last) || '').length });
+      const file = resolveFile(ctx, targetPath(ctx, ctx.args));
+      const view = viewOfFile(ctx.obsidian, file.path);
+      if (!view) {
+        throw opError(
+          'no-editor-open',
+          '这一篇不是屏幕上最上层那篇，AI 协同编辑只对那一篇生效。' +
+            '先 obsidian.workspace.open 把它打开并切到最上层；或者用文件方式（obsidian.note.append 等）。',
+        );
       }
+      const cur = aiCursorOf(ctx);
+      const doc = view.state.doc;
 
-      if (typeof ed.replaceSelection === 'function') {
-        ed.replaceSelection(text);
-      } else if (typeof ed.setValue === 'function' && typeof ed.getValue === 'function') {
-        ed.setValue(`${ed.getValue()}${text}`);
+      let at;
+      if (ctx.args.position === 'end') {
+        at = doc.length;
       } else {
-        throw opError('unsupported', '当前编辑器不支持插入');
+        const st = cur.forPath(file.path);
+        // AI 光标是按文件归属的：换了一篇就会重置成 {0,0}。
+        // 这时候直接插会静默写进文首——主人在中途切了笔记就会写错文件。
+        // 所以宁可报错，让他先用 editor.aiCursor 指定位置。
+        if (!st.path || st.path !== file.path || (st.head.line === 0 && st.head.ch === 0 && !st.anchor)) {
+          throw opError(
+            'no-ai-cursor',
+            'AI 光标不在这一篇的指定位置上。先调 editor.aiCursor 设 line/ch（或 position:"end"），' +
+              '否则会写到文首——那几乎一定不是你想要的。',
+          );
+        }
+        at = requireOffset(doc, st.head, 'AI 光标位置');
       }
+
+      // 只发 changes：AI 的字插进去，你的光标按逻辑位置自己维护，不被搬动
+      notifyAiEdit(ctx, 'editing', file.path);
+      dispatchAiEdit(view, { from: at, to: at, insert: text });
+      syncAiCursor(cur, file.path, view.state.doc, at + text.length);
+      // 默认立刻落盘：文件系统那边马上能读到，两种读法不会撞版本
+      const saved = ctx.args.save === false ? false : await saveDoc(ctx.obsidian, file.path);
+      notifyAiEdit(ctx, saved ? 'saved' : 'done', file.path);
 
       return {
         inserted: true,
-        position,
-        cursor: typeof ed.getCursor === 'function' ? ed.getCursor() : null,
+        mode: ctx.args.position === 'end' ? 'end' : 'ai-cursor',
+        at,
+        saved,
+        aiCursor: cur.snapshot(),
       };
     },
   },
   {
     id: 'obsidian.editor.replace',
     tier: 'write',
-    summary: '替换选中内容；给了 from/to 就先选中那个范围再替换',
-    run(ctx) {
-      const active = requireEditor(ctx);
+    summary: '替换 AI 自己选中的范围（不动你的光标和选区）；可用 from/to 先改选；改完立刻落盘',
+    async run(ctx) {
       const text = ctx.args && ctx.args.text;
       if (typeof text !== 'string') throw opError('bad-args', '缺少 text');
-      const ed = active.editor;
-      const from = ctx.args.from;
-      const to = ctx.args.to;
-      const hadRange = Boolean(from && to && typeof ed.setSelection === 'function');
-      if (hadRange) ed.setSelection(from, to);
-      if (typeof ed.replaceSelection !== 'function') throw opError('unsupported', '当前编辑器不支持替换');
-      ed.replaceSelection(text);
-      return { replaced: true, hadRange, target: hadRange ? { from, to } : 'selection' };
+      const file = resolveFile(ctx, targetPath(ctx, ctx.args));
+      const view = viewOfFile(ctx.obsidian, file.path);
+      if (!view) {
+        throw opError(
+          'no-editor-open',
+          '这一篇不是屏幕上最上层那篇，AI 协同编辑只对那一篇生效。' +
+            '先 obsidian.workspace.open 把它打开并切到最上层；或者用文件方式。',
+        );
+      }
+      const cur = aiCursorOf(ctx);
+      const doc = view.state.doc;
+
+      // 给了 from/to 就先把 AI 的选区挪过去（只改 AI 的，不碰你的）
+      if (ctx.args.from && ctx.args.to) cur.select(file.path, ctx.args.from, ctx.args.to);
+      const r = cur.range(file.path);
+
+      const from = requireOffset(doc, r.from, '替换起点');
+      const to = requireOffset(doc, r.to, '替换终点');
+      if (r.empty) {
+        throw opError('empty-selection', 'AI 没有选中任何内容：先 editor.aiCursor 选一段，或者带 from/to');
+      }
+
+      notifyAiEdit(ctx, 'editing', file.path);
+      dispatchAiEdit(view, { from, to, insert: text });
+      syncAiCursor(cur, file.path, view.state.doc, from + text.length);
+      const saved = ctx.args.save === false ? false : await saveDoc(ctx.obsidian, file.path);
+      notifyAiEdit(ctx, saved ? 'saved' : 'done', file.path);
+
+      return { replaced: true, from: r.from, to: r.to, saved, aiCursor: cur.snapshot() };
     },
   },
   {
     id: 'obsidian.editor.cursor',
     tier: 'write',
-    summary: '把光标移到指定行/列，并滚动到可见位置',
+    summary: '移动 AI 自己的光标（不显示、不动你的；之后的 editor.* 都基于它）',
     run(ctx) {
-      const active = requireEditor(ctx);
+      const file = resolveFile(ctx, targetPath(ctx, ctx.args));
+      const cur = aiCursorOf(ctx);
       const line = Number(ctx.args && ctx.args.line);
       if (!Number.isInteger(line) || line < 0) throw opError('bad-args', '缺少合法的 line（0 起）');
       const ch = Number.isInteger(ctx.args.ch) && ctx.args.ch >= 0 ? ctx.args.ch : 0;
-      const ed = active.editor;
-      if (typeof ed.setCursor !== 'function') throw opError('unsupported', '当前编辑器不支持定位');
-      ed.setCursor({ line, ch });
-      if (typeof ed.scrollIntoView === 'function') {
-        ed.scrollIntoView({ from: { line, ch }, to: { line, ch } }, true);
+      const st = cur.move(file.path, { line, ch });
+      return {
+        moved: true,
+        path: file.path,
+        aiCursor: st,
+        note: '移动的是 AI 自己的光标，你的光标没有被移动',
+      };
+    },
+  },
+  {
+    id: 'obsidian.editor.aiCursor',
+    tier: 'write',
+    summary: 'AI 自己的光标：读当前位置，或选一段（select / collapse）。和你的光标完全隔离',
+    run(ctx) {
+      const file = resolveFile(ctx, targetPath(ctx, ctx.args));
+      const cur = aiCursorOf(ctx);
+      const args = ctx.args || {};
+
+      if (args.select && args.select.from && args.select.to) {
+        cur.select(file.path, args.select.from, args.select.to);
+      } else if (args.collapse === true) {
+        cur.collapse(file.path);
+      } else if (Number.isInteger(args.line)) {
+        cur.move(file.path, { line: args.line, ch: args.ch });
       }
-      return { cursor: { line, ch } };
+
+      const st = cur.forPath(file.path);
+      return {
+        path: file.path,
+        aiCursor: st,
+        selection: cur.range(file.path),
+        note: 'AI 的光标/选区，不会和你的互相影响',
+      };
     },
   },
   {

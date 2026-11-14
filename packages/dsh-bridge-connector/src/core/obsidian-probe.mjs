@@ -132,8 +132,6 @@ export function mergeActiveNote(live, pushed) {
       path: live.path,
       title: (same && same.title) || baseName(live.path) || null,
       cursor: live.cursor,
-      // focused=false：焦点不在编辑器里，光标是「最后一次停的位置」
-      focused: live.focused !== false,
       // 现查有选区就用现查的；它明确说没有，就用缓存的说法（缓存查过才敢说「没有」）
       selection: live.selection || (same ? same.selection : null) || null,
       lineCount: live.lineCount ?? (same ? same.lineCount : null) ?? null,

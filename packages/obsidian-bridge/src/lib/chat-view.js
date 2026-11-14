@@ -7,6 +7,7 @@ const fs = require('node:fs');
 const { parseLedger } = require('./ledger-reader.js');
 const { reconcileInjection } = require('./settings.js');
 const { pickMissingReply, shouldReconcile } = require('./reply-reconcile.js');
+const { pickReplyAnchor } = require('./scroll-anchor.js');
 
 const VIEW_TYPE = 'bridge-chat';
 const RECENT_LIMIT = 15;
@@ -66,6 +67,7 @@ class BridgeChatView extends ItemView {
 
   onClose() {
     if (this.pendingTimer) { clearTimeout(this.pendingTimer); this.pendingTimer = null; }
+    if (this._lineTimer) { clearInterval(this._lineTimer); this._lineTimer = null; }
     // 用户主动关掉面板：下次启动别再自己弹出来
     this.plugin.settings.chatOpen = false;
     this.plugin.persistSettings();
@@ -158,21 +160,39 @@ class BridgeChatView extends ItemView {
     this.metaEl = root.createDiv({ cls: 'bridge-meta', text: '' });
 
     this.listEl = root.createDiv({ cls: 'bridge-chat-list' });
+    // 是否贴着底部，由「用户自己的滚动」决定，而不是每次重建后再算一遍——
+    // 重建那一刻 scrollHeight 还没稳定，算出来的值经常是错的，于是又把人拽到底下。
+    this._stickToBottom = true;
+    this.listEl.addEventListener('scroll', () => {
+      this._stickToBottom = this.isAtBottom();
+      this.updateJumpButton();
+    });
 
-    const inputWrap = root.createDiv({ cls: 'bridge-chat-input' });
+    // 输入区做成一个整体：上面是输入框，下面一条工具条，靠右排「回底 / 打断 / 发送」
+    const inputWrap = root.createDiv({ cls: 'bridge-composer' });
     this.inputEl = inputWrap.createEl('textarea', {
       cls: 'bridge-chat-textarea',
       attr: { placeholder: '跟 DSH 说点什么…（Enter 发送，Shift+Enter 换行）', rows: '3' },
     });
+    const bar = inputWrap.createDiv({ cls: 'bridge-composer-bar' });
+
+    // 回到底部：一开始禁用，往上翻历史时才亮起来
+    this.jumpEl = bar.createEl('button', { cls: 'bridge-composer-btn bridge-jump-bottom', text: '↓' });
+    this.jumpEl.title = '回到最底下';
+    this.jumpEl.onClickEvent(() => {
+      this.scrollToBottom();
+      this.updateJumpButton();
+    });
+
     // queue = 排队等这一轮结束；steer = 立刻打断当前这一轮
-    this.steerBtn = inputWrap.createEl('button', { cls: 'bridge-chat-steer', text: '打断' });
+    this.steerBtn = bar.createEl('button', { cls: 'bridge-composer-btn bridge-chat-steer', text: '打断' });
     this.steerBtn.title = '默认排队（等这一轮结束）。点亮「打断」则立刻插进当前这一轮。';
     this.steerBtn.onClickEvent(() => {
       this.steerMode = !this.steerMode;
       this.steerBtn.toggleClass('is-on', this.steerMode);
       new Notice(this.steerMode ? '发送模式：打断当前一轮' : '发送模式：排队等待');
     });
-    this.sendBtn = inputWrap.createEl('button', { cls: 'bridge-chat-send', text: '发送' });
+    this.sendBtn = bar.createEl('button', { cls: 'bridge-composer-btn bridge-chat-send', text: '发送' });
     this.sendBtn.onClickEvent(() => this.send());
     this.inputEl.addEventListener('keydown', (ev) => {
       if (ev.key === 'Enter' && !ev.shiftKey) {
@@ -374,8 +394,10 @@ class BridgeChatView extends ItemView {
       const text = Array.isArray(content)
         ? content.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('')
         : '';
+      // 按行排队吐出来：一次全出现会让人分不清「刚出来的」和「早就在那儿的」
       if (text) {
-        this.assistantBuffer += text;
+        this.assistantBuffer = (this.assistantBuffer || '') + text;
+        this._renderAnchor = 'reply';
         this.render();
       }
       return;
@@ -386,6 +408,7 @@ class BridgeChatView extends ItemView {
       if (this.assistantBuffer) {
         this.messages.push({ role: 'assistant', text: this.assistantBuffer });
         this.assistantBuffer = '';
+        this._renderAnchor = 'reply';
       }
       this.render();
       this.setStatus('就绪');
@@ -436,6 +459,8 @@ class BridgeChatView extends ItemView {
   async deliver(parts, isSteer) {
     const text = parts.join('\n');
     this.messages.push({ role: 'user', text });
+    // 自己刚发了话，理应跟到底部看回复
+    this._stickToBottom = true;
     this.render();
     this.setStatus(isSteer ? '发送中…' : '排队中…');
     const res = await this.plugin.connector().sendTask({
@@ -587,8 +612,99 @@ class BridgeChatView extends ItemView {
     }
   }
 
+  // 是否已经贴在最底下（往上翻看历史时不该被拽回来）
+  isAtBottom() {
+    const el = this.listEl;
+    if (!el) return true;
+    return el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  }
+
+  scrollToBottom() {
+    const el = this.listEl;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }
+
+  // 元素相对列表内容的位置和高度。用 rect 差值算，不受 offsetParent 影响。
+  rectInList(node) {
+    const el = this.listEl;
+    if (!el || !node) return null;
+    const nr = node.getBoundingClientRect();
+    const er = el.getBoundingClientRect();
+    return { top: nr.top - er.top + el.scrollTop, height: nr.height };
+  }
+
+  // 一行有多高：优先用计算样式；拿到 "normal" 就按字号估。
+  lineHeightOf(node) {
+    try {
+      const cs = window.getComputedStyle(node);
+      const lh = parseFloat(cs.lineHeight);
+      if (Number.isFinite(lh) && lh > 0) return lh;
+      const fs = parseFloat(cs.fontSize);
+      if (Number.isFinite(fs) && fs > 0) return fs * 1.6;
+    } catch {
+      /* 拿不到就算了，锚点会退回气泡底部 */
+    }
+    return null;
+  }
+
+  // 让最后一条 AI 回复紧贴着我说的那句话出现：
+  // 短消息从它顶部看起，长消息只留最后两行——回复的开头始终紧接在下面。
+  // 具体算法见 scroll-anchor.js。
+  scrollToReplyAnchor() {
+    const el = this.listEl;
+    if (!el) return;
+    const kids = Array.from(el.children || []);
+    let assistantTop = null;
+    let userNode = null;
+    let seenReply = false;
+    for (let i = kids.length - 1; i >= 0; i -= 1) {
+      const node = kids[i];
+      if (!node.classList) continue;
+      if (!seenReply) {
+        if (node.classList.contains('bridge-msg-assistant')) {
+          assistantTop = this.rectInList(node)?.top ?? null;
+          seenReply = true;
+        }
+        continue;
+      }
+      // 回复上面最近的那句我说的话（待发气泡在回复后面，不会走到这里）
+      if (node.classList.contains('bridge-msg-user')) {
+        userNode = node;
+        break;
+      }
+    }
+    const userRect = userNode ? this.rectInList(userNode) : null;
+    const target = pickReplyAnchor({
+      userTop: userRect ? userRect.top : null,
+      userHeight: userRect ? userRect.height : null,
+      assistantTop,
+      viewHeight: el.clientHeight,
+      lineHeight: userNode ? this.lineHeightOf(userNode) : null,
+    });
+    // 没有可对齐的回复（比如刚打开会话）：还是滚到底
+    if (target === null) {
+      this.scrollToBottom();
+      return;
+    }
+    el.scrollTop = Math.max(0, target);
+  }
+
+  updateJumpButton() {
+    if (!this.jumpEl) return;
+    // 在工具条里，不靠隐藏来腾位置——那样按钮会跳来跳去；
+    // 改成「不可用」：位置固定，只是变灰
+    const away = !this.isAtBottom();
+    this.jumpEl.toggleClass('is-disabled', !away);
+    this.jumpEl.title = away ? '回到最底下' : '已经在最底下了';
+  }
+
   render() {
     if (!this.listEl) return;
+    // 渲染前先记住有没有贴在底部：新消息进来时，
+    // 正在往上翻的人不该被拽到底下，什么也没看清
+    const stick = this._stickToBottom !== false;
+    const keepTop = this.listEl.scrollTop;
     this.listEl.empty();
     for (const msg of this.messages) {
       const el = this.listEl.createDiv({ cls: `bridge-msg bridge-msg-${msg.role}` });
@@ -608,7 +724,16 @@ class BridgeChatView extends ItemView {
         el.setText(text);
       }
     }
-    this.listEl.scrollTop = this.listEl.scrollHeight;
+    if (stick) {
+      // 刚发完自己的话就是要看自己的话（bottom）；
+      // AI 回复进来则停在回复开头（reply），不让长回复把人带到底下。
+      if (this._renderAnchor === 'reply') this.scrollToReplyAnchor();
+      else this.scrollToBottom();
+    } else {
+      this.listEl.scrollTop = keepTop;
+    }
+    this._renderAnchor = 'bottom';
+    this.updateJumpButton();
   }
 }
 

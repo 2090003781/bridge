@@ -23,6 +23,8 @@ const { BridgeLogModal } = require('./lib/log-view.js');
 const { createPluginLog } = require('./lib/plugin-log.js');
 const { createMarkExtension, refreshAllMarkViews } = require('./lib/mark-decoration.js');
 const { nextMarkState, describeMarks, marksForPath } = require('./lib/mark-store.js');
+const { createAiCursor } = require('./lib/ai-cursor.js');
+const { createAiCursorSync } = require('./lib/ai-cursor-sync.js');
 
 const INFO_DIR = path.join(os.homedir(), '.obsidian-bridge');
 const CONNECTOR_FILE = path.join(os.homedir(), '.dsh-bridge', 'connector.json');
@@ -92,6 +94,22 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
     // 标记：只在屏幕上画（CodeMirror 装饰），文档一个字节都不动。
     // 装饰层拿不到就降级——标记本身的记录和播报不依赖它，别为了「看得见」
     // 把整个插件搞挂（那样连命令都注册不上）。
+    // AI 自己的光标：位置和选区都存这儿，不显示、不碰主人的
+    this.aiCursor = createAiCursor();
+
+    // 主人改文字时，AI 光标跟着那段字挪，不会落到别的字中间。
+    // 拿不到 CodeMirror 就跳过——光标不跟随只是不够聪明，不该拖垮插件。
+    try {
+      this.registerEditorExtension(
+        createAiCursorSync({
+          getAiCursor: () => this.aiCursor,
+          resolvePath: (cmView) => this.pathOfEditorView(cmView),
+        }),
+      );
+    } catch (err) {
+      this.logEvent('ai-cursor', '跟随同步不可用：' + String((err && err.message) || err));
+    }
+
     this._marks = [];
     this._markVisible = false;
     try {
@@ -182,6 +200,45 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
 
   // 当前打开的笔记 —— 推给连接器，agent 那边就能直接读到「屏幕上这一篇」。
   // 内容取编辑器缓冲（getValue），所以还没保存的改动也在里面，这正是要的效果。
+  // AI 每完成一次编辑，在状态栏亮一下「AI 编辑完成」，几秒后自己消失。
+  // 不带文件名、不带时间：主人只要知道「刚才那下是 AI 动的」就够了，
+  // 加东西反而要读。连续操作就把计时器重置，一直是亮着的。
+  onAiEdit(phase) {
+    try {
+      if (phase === 'editing') return; // AI 不是逐字打字，没有「编辑中」这个阶段
+      if (!this.aiStatusEl) {
+        this.aiStatusEl = this.addStatusBarItem();
+        this.aiStatusEl.addClass('bridge-ai-status');
+      }
+      this.aiStatusEl.setText('AI 编辑完成');
+      this.aiStatusEl.style.display = '';
+      if (this._aiNoticeTimer) clearTimeout(this._aiNoticeTimer);
+      this._aiNoticeTimer = setTimeout(() => {
+        this._aiNoticeTimer = null;
+        if (this.aiStatusEl) {
+          this.aiStatusEl.setText('');
+          this.aiStatusEl.style.display = 'none';
+        }
+      }, 1500);
+    } catch {
+      /* 状态栏出问题不该打断写入 */
+    }
+  }
+
+  // 某个 CodeMirror 视图对应哪篇笔记（同步器要用它确认是哪一篇）
+  pathOfEditorView(cmView) {
+    try {
+      const leaves = this.app.workspace.getLeavesOfType('markdown') || [];
+      for (const leaf of leaves) {
+        const v = leaf && leaf.view;
+        if (v && v.editor && v.editor.cm === cmView) return v.file ? v.file.path : null;
+      }
+    } catch {
+      /* 布局在重建 */
+    }
+    return null;
+  }
+
   // 屏幕上那篇笔记（不看焦点）：焦点在面板输入框时 activeLeaf 是面板，
   // 所以要先看活跃编辑器，没有就问布局「哪个 markdown 标签活着」。
   topMarkdownView() {
@@ -333,11 +390,11 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
       const activeView = workspace.activeLeaf && workspace.activeLeaf.view;
       // ① 焦点就在编辑器里：最准
       if (isMdView(activeView)) {
-        return { file: activeView.file, editor: activeView.editor, focused: true };
+        return { file: activeView.file, editor: activeView.editor };
       }
       // ② 焦点在面板/侧栏：看主编辑区最上层那篇
       const top = mainMarkdownView();
-      if (top) return { file: top.file, editor: top.editor, focused: false };
+      if (top) return { file: top.file, editor: top.editor };
 
       const leaves =
         typeof workspace.getLeavesOfType === 'function' ? workspace.getLeavesOfType('markdown') : [];
@@ -346,19 +403,19 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
         for (const leaf of leaves) {
           const v = leaf && leaf.view;
           if (isMdView(v) && v.file.path === lastPath) {
-            return { file: v.file, editor: v.editor, focused: false };
+            return { file: v.file, editor: v.editor };
           }
         }
       }
       // ④ 兜底：还开着的任意一篇
       for (let i = leaves.length - 1; i >= 0; i -= 1) {
         const v = leaves[i] && leaves[i].view;
-        if (isMdView(v)) return { file: v.file, editor: v.editor, focused: false };
+        if (isMdView(v)) return { file: v.file, editor: v.editor };
       }
       return null;
     };
 
-    const describe = (file, editor, focused) => {
+    const describe = (file, editor) => {
       let text = '';
       try {
         text = editor.getValue();
@@ -409,8 +466,6 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
         cursor: cursor ? { line: cursor.line, ch: cursor.ch } : null,
         selection,
         heading: cursor ? headingAt(text, cursor.line) : null,
-        // 焦点在不在编辑器里：不在的时候光标是「最后一次停的位置」，不是实时值
-        focused,
         others: others.slice(0, 8),
         // 当前这篇上的临时标记（最多两个：点 / 范围）
         marks: marksForPath(this._marks, file.path).slice(0, 2),
@@ -449,7 +504,7 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
         }
         return;
       }
-      const note = describe(cur.file, cur.editor, cur.focused);
+      const note = describe(cur.file, cur.editor);
       const key = keyOf(note);
       if (!force && key === lastKey) return;
       lastKey = key;
@@ -647,7 +702,11 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
       },    });
     this.permissions = permissions;
 
-    const driver = createDriver({ obsidian: this.app });
+    const driver = createDriver({
+      obsidian: this.app,
+      aiCursor: this.aiCursor,
+      onAiEdit: (phase, filePath) => this.onAiEdit(phase, filePath),
+    });
     const ledgerPath = this.ledgerPath();
     const ledger = createLedger({
       sink: (entry) => {
@@ -1032,7 +1091,13 @@ class BridgeSettingTab extends PluginSettingTab {
 
     containerEl.createEl('h3', { text: '操作目录' });
     if (plugin.core) {
-      const driver = createDriver({ obsidian: this.app });
+      // 这里是 SettingTab，this 不是插件：用 plugin.* 才是对的。
+      // 之前写成 this.aiCursor 拿到 undefined，被 driver 的兜底悄悄盖掉了。
+      const driver = createDriver({
+        obsidian: plugin.app,
+        aiCursor: plugin.aiCursor,
+        onAiEdit: (phase, filePath) => plugin.onAiEdit(phase, filePath),
+      });
       for (const op of driver.list().ops) {
         containerEl.createEl('p', {
           text: `${op.id} · ${op.tier} · ${op.summary}`,
