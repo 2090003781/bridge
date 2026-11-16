@@ -329,3 +329,17 @@
   background: var(--interactive-accent-hover);
   color: var(--text-on-accent);
 }
+
+/* 面板里的图片：别撑破气泡，也别把整列挤歪。
+   库外的图是 data URL 内联进来的，体积可能不小，这里只约束显示尺寸。 */
+.bridge-msg img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 6px 0;
+  border-radius: 6px;
+}
+/* 图片别被聊天记录的行高/文本流切碎 */
+.bridge-msg p:has(> img) {
+  margin: 4px 0;
+}

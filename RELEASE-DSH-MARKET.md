@@ -19,6 +19,19 @@ description:
 > monorepo 的规则：`url` 指到子目录，`name` 用 `owner/repo#子包名`，文件名把路径里的 `/` 换成 `-`。
 > 根目录或子包声明 `dsh.bundle` 都算合规——我们是子包里有。
 
+## 发到 npm（2026-11-17 起有了）
+
+连接器已发布：`//registry.npmjs.org/dsh-bridge-connector`，用户 `charlie_cc`。
+
+```sh
+cd packages/dsh-bridge-connector
+npm publish --access public
+```
+
+- 首次发布会先建一个 `0.0.0-stage` 占位版本，真实版本几分钟后才出现（npm 的处理流水线）
+- 账号开了 auth-and-writes 双因素：普通 token 会被 EOTP 挡住；带「Bypass 2FA」的 granular token 能发，但**不能** `npm unpublish`（403），所以占位版本删不掉，留着无妨
+- 包名跟着 monorepo 版本走；发版时两端一起升，npm 和 GitHub Release 才对得上
+
 ## 下载量是怎么统计的（2026-11-14 查证）
 
 市场**不数 GitHub Release 资产的下载次数**。`data/downloads.json` 里的数字来自 npm：

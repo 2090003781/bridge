@@ -224,8 +224,10 @@ const { ItemView, Notice, Modal, Setting, TFolder, MarkdownRenderer } = require(
 const fs = require('node:fs');
 const { parseLedger } = __req('lib/ledger-reader.js');
 const { reconcileInjection } = __req('lib/settings.js');
-const { pickMissingReply, shouldReconcile } = __req('lib/reply-reconcile.js');
 const { pickReplyAnchor } = __req('lib/scroll-anchor.js');
+const { HISTORY_LIMIT, transcriptState, mergeTranscript } = __req('lib/session-context.js');
+const { rewriteLocalImages } = __req('lib/image-embed.js');
+const { displayTextOf } = __req('lib/panel-text.js');
 
 const VIEW_TYPE = 'bridge-chat';
 const RECENT_LIMIT = 15;
@@ -249,8 +251,9 @@ class BridgeChatView extends ItemView {
     this.pendingTimer = null;
     this.mergeWindowMs = 1500; // 最后一次输入后等这么久再合并发出
     this.sessionId = null;
+    // 每切一次会话 +1：历史请求靠它认住自己属于哪一次切换
+    this._switchToken = 0;
     this.ac = null;
-    this.sideTimer = null;
   }
 
   getViewType() {
@@ -277,7 +280,10 @@ class BridgeChatView extends ItemView {
     this.renderSide();
     this.renderChat();
 
-    this.sideTimer = setInterval(() => this.refreshRemoteState(), 5000);
+    // 不做定时轮询：窗口拿回焦点时对一次账（注入开关变了、或者断线期间漏了事件）
+    this.registerDomEvent(window, 'focus', () => {
+      this.refreshRemoteState();
+    });
 
     await this.ensureSession();
     this.refreshRemoteState();
@@ -285,14 +291,9 @@ class BridgeChatView extends ItemView {
 
   onClose() {
     if (this.pendingTimer) { clearTimeout(this.pendingTimer); this.pendingTimer = null; }
-    if (this._lineTimer) { clearInterval(this._lineTimer); this._lineTimer = null; }
     // 用户主动关掉面板：下次启动别再自己弹出来
     this.plugin.settings.chatOpen = false;
     this.plugin.persistSettings();
-    if (this.sideTimer) {
-      clearInterval(this.sideTimer);
-      this.sideTimer = null;
-    }
     this.disconnect();
   }
 
@@ -467,16 +468,39 @@ class BridgeChatView extends ItemView {
     return items.some((s) => s && s.sessionId === sessionId);
   }
 
+  // 切会话要换掉的不只是 id：窗口里的消息、流式缓冲、合并盒、
+  // 上一条会话的补回复轮询，全属于旧会话，一样都不该留在新会话里。
   bindSession(sessionId) {
     this.sessionId = sessionId;
     this.plugin.settings.chatSessionId = sessionId;
     this.plugin.saveSettings();
+    this._switchToken += 1;
+    this.stashPendingIntoInput();
     this.messages = [];
+    this.assistantBuffer = '';
+    // 切过去就该看到最新那几条，而不是停在旧会话滚到的位置
+    this._stickToBottom = true;
+    this._renderAnchor = 'bottom';
     this.render();
     this.setStatus('已连接');
     this.refreshLocalState();
     this.connect();
     this.loadHistory();
+  }
+
+  // 合并盒（攒着还没发的那几条）在切会话时清掉，但话得留着：
+  // 放回输入框，既不会丢，也不会误发到刚切过去的会话里。
+  stashPendingIntoInput() {
+    if (this.pendingTimer) {
+      clearTimeout(this.pendingTimer);
+      this.pendingTimer = null;
+    }
+    if (!this.pending.length) return;
+    const text = this.pending.join('\n');
+    this.pending = [];
+    if (!this.inputEl) return;
+    const current = String(this.inputEl.value || '');
+    this.inputEl.value = current.trim() ? current + '\n' + text : text;
   }
 
   // 拉会话列表 → 弹树（工作区 → 会话），选中就绑定
@@ -499,9 +523,9 @@ class BridgeChatView extends ItemView {
     new SessionTreeModal(this.app, items, this.sessionId, (sessionId) => {
       this.bindSession(sessionId);
       new Notice('已切换会话');
-      }, (workspaceId) => {
-        this.createAndBind(workspaceId);
-      }).open();
+    }, (workspaceId) => {
+      this.createAndBind(workspaceId);
+    }).open();
   }
 
   // 确保当前库目录在 DSH 里是一个工作区：没有就注册一个（标题用库名）。
@@ -546,17 +570,31 @@ class BridgeChatView extends ItemView {
     new Notice('已新建 Bridge 会话');
   }
 
-  // reload 后把会话里最近的消息读回来：面板自己不存历史，消息都在 DSH 那边
+  // 把会话里最近的消息读回来：面板自己不存历史，消息都在 DSH 那边。
+  // 切会话后也是靠它把窗口换成新会话的上下文，所以每次绑定都重拉一次，
+  // 并用切换序号认住「这次请求属于哪一次切换」——迟到的结果直接丢掉，
+  // 否则慢半拍的上一条会话历史会盖到新会话的窗口上。
   async loadHistory() {
     if (!this.sessionId) return;
+    const token = this._switchToken;
+    const sessionId = this.sessionId;
     try {
-      const res = await this.plugin.connector().transcript(this.sessionId, 20);
+      const res = await this.plugin.connector().transcript(sessionId, HISTORY_LIMIT);
       if (!res || res.ok !== true) return;
+      const verdict = transcriptState({
+        reqToken: token,
+        curToken: this._switchToken,
+        reqSession: sessionId,
+        curSession: this.sessionId,
+      });
+      if (verdict !== 'apply') return;
       const items = (res.data && res.data.messages) || [];
-      if (!items.length) return;
-      // 载入期间用户可能已经发过消息，别覆盖掉
-      if (this.messages.length > 0) return;
-      this.messages = items.map((m) => ({ role: m.role, text: m.text }));
+      // 日志里有什么拿什么：这一轮还没答完也没关系，
+      // 答完的内容会照常走事件补进来
+      const history = items.map((m) => ({ role: m.role, text: m.text }));
+      // 加载期间可能已经有新消息到了（自己刚发的、事件推来的）：
+      // 历史打底，把它们接在后面，同一条不重复
+      this.messages = mergeTranscript({ transcript: history, live: this.messages });
       this.render();
     } catch {
       /* 读历史失败不影响发消息 */
@@ -580,6 +618,8 @@ class BridgeChatView extends ItemView {
           if (this.ac === ac && !ac.signal.aborted && this.sessionId) {
             this.setStatus('重连中…');
             this.connect();
+            // 断线期间漏了什么不知道，重连后拉一次最近的消息兜住
+            this.loadHistory();
           }
         }, 3000);
       });
@@ -621,8 +661,6 @@ class BridgeChatView extends ItemView {
       return;
     }
     if (type === 'turn/end') {
-      // 事件到了就是快路通了，兜底可以退休
-      this.stopReplyWatch();
       if (this.assistantBuffer) {
         this.messages.push({ role: 'assistant', text: this.assistantBuffer });
         this.assistantBuffer = '';
@@ -630,12 +668,11 @@ class BridgeChatView extends ItemView {
       }
       this.render();
       this.setStatus('就绪');
-      this.refreshRecent();
       return;
     }
     if (type === 'tool-call') {
-      const name = event.data && (event.data.name || (event.data.toolCall && event.data.toolCall.name));
-      if (name) this.setStatus('执行：' + name);
+      // 工具名一次一换、跳得厉害；状态行只留一句「执行中」
+      this.setStatus('执行中…');
     }
   }
 
@@ -687,7 +724,6 @@ class BridgeChatView extends ItemView {
       mode: isSteer ? 'steer' : 'queue',
     });
     if (!res || res.ok !== true) {
-      this.stopReplyWatch();
       const raw = (res && res.error && res.error.message) || '发送失败';
       this.setStatus('发送失败');
       if (/resume failed|not found/i.test(raw)) {
@@ -702,57 +738,6 @@ class BridgeChatView extends ItemView {
     }
     // 投出去了：状态往前推一格，别一直停在「排队中」——那是在等投递，不是等回复。
     this.setStatus('已发出，等待回复…');
-    // 起一条慢路兜底。SSE 断线、事件漏收、或者那一轮压根没产生文本，
-    // 面板都会永远停在「思考中…」，看起来就是「agent 没回我」。
-    this.startReplyWatch();
-  }
-
-  // 投递后的对账：只问会话真相（/sessions 的 running + /transcript 的消息），
-  // 不看事件。只要那一轮真的跑完了，回复就能被捞出来补上。
-  startReplyWatch() {
-    this.stopReplyWatch();
-    const startedAt = Date.now();
-    this._waitingReply = true;
-    this.replyWatchTimer = setInterval(async () => {
-      const elapsedMs = Date.now() - startedAt;
-      if (elapsedMs > 180000) {
-        this.stopReplyWatch();
-        return;
-      }
-      let running;
-      try {
-        const list = await this.plugin.connector().sessions();
-        const items = (list && list.data && list.data.sessions) || [];
-        const mine = items.find((x) => x && x.sessionId === this.sessionId);
-        running = mine ? mine.running : undefined;
-      } catch {
-        running = undefined;
-      }
-      if (!shouldReconcile({ running, waiting: this._waitingReply === true, elapsedMs })) return;
-      try {
-        const t = await this.plugin.connector().transcript(this.sessionId, 6);
-        const msgs = (t && t.data && t.data.messages) || [];
-        const missing = pickMissingReply(this.messages, msgs);
-        if (missing) {
-          this.messages.push(missing);
-          this.render();
-          this.plugin.logEvent('chat', '事件没到，按会话日志补了一条回复');
-        }
-        this.setStatus('就绪');
-        this.stopReplyWatch();
-      } catch {
-        /* 下一拍再试 */
-      }
-    }, 3000);
-    this.register(() => this.stopReplyWatch());
-  }
-
-  stopReplyWatch() {
-    if (this.replyWatchTimer) {
-      clearInterval(this.replyWatchTimer);
-      this.replyWatchTimer = null;
-    }
-    this._waitingReply = false;
   }
 
   openInjectionPanel() {
@@ -821,12 +806,39 @@ class BridgeChatView extends ItemView {
     this.render();
   }
 
+  // 渲染用的基准路径：相对图片、相对附件按「正在看的那篇」解析。
+  // 空字符串会让相对路径全部解析失败，图就显示不出来。
+  sourcePathForRender() {
+    try {
+      const file = this.app.workspace.getActiveFile();
+      if (file && file.path) return file.path;
+    } catch {
+      /* 没有活动文件就退回库根 */
+    }
+    return '';
+  }
+
+  // 库外的本地绝对路径（agent 存的截图之类）Obsidian 不会自己去读，
+  // 先读成 data URL 再交给渲染器，图才真的显示出来。
+  prepareMarkdown(text) {
+    const body = String(text || '');
+    try {
+      return rewriteLocalImages(body, {
+        vaultRoot: this.app.vault.adapter.getBasePath(),
+        readFile: (target) => fs.readFileSync(target),
+      });
+    } catch {
+      return body;
+    }
+  }
+
   // Obsidian 自带渲染器；失败就退回纯文本，不能让一条消息把面板弄崩。
   renderMarkdown(el, text) {
+    const body = String(text || '');
     try {
-      MarkdownRenderer.render(this.app, String(text || ''), el, '', this);
+      MarkdownRenderer.render(this.app, this.prepareMarkdown(body), el, this.sourcePathForRender(), this);
     } catch {
-      el.setText(String(text || ''));
+      el.setText(body);
     }
   }
 
@@ -925,10 +937,13 @@ class BridgeChatView extends ItemView {
     const keepTop = this.listEl.scrollTop;
     this.listEl.empty();
     for (const msg of this.messages) {
+      // 时间戳、坐标行、压缩摘要这些不是主人敲的字：剥掉，剥空了就不占位
+      const shown = displayTextOf(msg);
+      if (!shown) continue;
       const el = this.listEl.createDiv({ cls: `bridge-msg bridge-msg-${msg.role}` });
-      // 助手回复按 Markdown 渲染（代码块、列表、粗体），用户自己的话保持纯文本
-      if (msg.role === 'assistant') this.renderMarkdown(el, msg.text);
-      else el.setText(msg.text);
+      // 助手回复按 Markdown 渲染（代码块、列表、图片），用户自己的话保持纯文本
+      if (msg.role === 'assistant') this.renderMarkdown(el, shown);
+      else el.setText(shown);
     }
     if (this.assistantBuffer) {
       const el = this.listEl.createDiv({ cls: 'bridge-msg bridge-msg-assistant bridge-msg-streaming' });
@@ -1519,6 +1534,108 @@ function createDriver(deps = {}) {
 module.exports = { createDriver };
 
 });
+__define('lib/image-embed.js', function (module, exports, require) {
+'use strict';
+// Bridge · 面板里把图片显示出来。
+//
+// markdown 的 ![alt](目标) 里，目标如果是本地绝对路径：
+//   库内（在 Obsidian 库里）→ 换成库相对路径，Obsidian 自己能解析；
+//   库外（比如 agent 存在临时目录的截图）→ Obsidian 不会为了一个外链去读磁盘，
+//     这里把文件读成 data URL 塞进去，才真的显示得出来。
+// 其余（http、data:、库内相对路径、wikilink 嵌入）原样不动。
+
+const IMAGE_MIME = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  jfif: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  avif: 'image/avif',
+  bmp: 'image/bmp',
+  svg: 'image/svg+xml',
+  ico: 'image/x-icon',
+};
+
+// 一张图最大内联多少：再大就把面板拖住了，宁可显示成坏链让人自己去开
+const DEFAULT_MAX_BYTES = 8 * 1024 * 1024;
+
+// ![alt](目标) —— 目标可以写成 <路径 带空格>
+const IMAGE_RE = /!\[([^\]]*)\]\(\s*(<[^>]*>|[^)\s]+)\s*\)/g;
+
+function toPosix(p) {
+  return String(p == null ? '' : p).replace(/\\/g, '/');
+}
+
+// C:\... 、d:/... 、\\server\share\... 算本地绝对路径
+function isAbsoluteLocal(target) {
+  const t = String(target == null ? '' : target);
+  if (/^[a-zA-Z]:[\\/]/.test(t)) return true;
+  if (/^\\\\/.test(t) || /^\/\//.test(t)) return true;
+  return false;
+}
+
+// 绝对路径在库里面的话，返回库相对路径；不在库里返回 null
+function relativeToRoot(root, absPath) {
+  const r = toPosix(root).replace(/\/+$/, '').toLowerCase();
+  const a = toPosix(absPath);
+  if (!r || !a) return null;
+  const lower = a.toLowerCase();
+  if (lower === r) return '';
+  if (!lower.startsWith(r + '/')) return null;
+  return a.slice(r.length + 1);
+}
+
+function mimeOf(target) {
+  const m = /\.([a-z0-9]+)$/i.exec(toPosix(target));
+  if (!m) return null;
+  return IMAGE_MIME[m[1].toLowerCase()] || null;
+}
+
+// 读成 data URL；读不到、不是图片、太大都返回 null
+function dataUrlOf(target, { readFile, maxBytes }) {
+  const mime = mimeOf(target);
+  if (!mime || typeof readFile !== 'function') return null;
+  let buf;
+  try {
+    buf = readFile(target);
+  } catch {
+    return null;
+  }
+  if (!buf || typeof buf.length !== 'number' || buf.length === 0) return null;
+  if (buf.length > maxBytes) return null;
+  return 'data:' + mime + ';base64,' + Buffer.from(buf).toString('base64');
+}
+
+// 路径里有空格要留给 <>，否则 markdown 解析到空格就断了
+function linkTarget(rel) {
+  return /\s/.test(rel) ? '<' + rel + '>' : rel;
+}
+
+function rewriteLocalImages(text, { vaultRoot, readFile, maxBytes = DEFAULT_MAX_BYTES } = {}) {
+  const src = String(text == null ? '' : text);
+  if (!src.includes('![')) return src;
+  return src.replace(IMAGE_RE, (whole, alt, raw) => {
+    const wrapped = raw.startsWith('<') && raw.endsWith('>');
+    const target = wrapped ? raw.slice(1, -1).trim() : raw;
+    if (!isAbsoluteLocal(target)) return whole;
+    const rel = relativeToRoot(vaultRoot, target);
+    if (rel) return '![' + alt + '](' + linkTarget(rel) + ')';
+    const dataUrl = dataUrlOf(target, { readFile, maxBytes });
+    if (!dataUrl) return whole;
+    return '![' + alt + '](' + dataUrl + ')';
+  });
+}
+
+module.exports = {
+  rewriteLocalImages,
+  isAbsoluteLocal,
+  relativeToRoot,
+  mimeOf,
+  DEFAULT_MAX_BYTES,
+};
+
+});
 __define('lib/info.js', function (module, exports, require) {
 'use strict';
 // Bridge · 服务信息文件
@@ -2002,6 +2119,68 @@ function marksForPath(all, path) {
 }
 
 module.exports = { nextMarkState, describeMarks, marksForPath, comparePos, modeOf };
+
+});
+__define('lib/panel-text.js', function (module, exports, require) {
+'use strict';
+// Bridge · 面板显示层：挡掉不是主人敲的字。
+//
+// 会话日志里混着三类注入内容，它们都长得像「用户消息」：
+//   1. <time-now> 时间戳 + 时区 + 间隔 这一坨（有的整条消息只有它）
+//   2. 注入的坐标行：【光标】… 【Obsidian】<真正的话>
+//   3. 上下文压缩出来的 checkpoint 摘要（几千字，全是给模型看的）
+// 前两类剥掉（剥空了就不显示这条），摘要整条不显示。
+
+const CHECKPOINT_RE = /^\s*This is an automatically generated checkpoint/i;
+const TIME_BLOCK_RE = /<time-now>[\s\S]*?<\/time-now>/gi;
+const TZ_LINE_RE = /^Browser time zone for this request:.*$/gim;
+const ELAPSED_LINE_RE = /^Elapsed since the preceding user message:.*$/gim;
+// 面板注入的坐标和正文之间的分隔标记
+const BODY_MARKER = '【Obsidian】';
+// 出现在分隔标记之前、说明这一段是注入内容的开头
+const INJECT_HEADS = ['【光标】', '【Obsidian 当前窗口】'];
+
+function looksInjected(head) {
+  const h = String(head == null ? '' : head).trim();
+  if (!h) return true;
+  if (INJECT_HEADS.some((m) => h.startsWith(m))) return true;
+  // 时间戳可能被排在正文后面，只要出现过就说明这条带注入
+  return h.includes('<time-now>');
+}
+
+function isCheckpoint(text) {
+  return CHECKPOINT_RE.test(String(text == null ? '' : text));
+}
+
+// 剥掉注入部分，留下主人真正说的话
+function stripInjected(text) {
+  let s = String(text == null ? '' : text);
+  const at = s.indexOf(BODY_MARKER);
+  // 标记之前长成注入的样子才当分隔符；主人自己在正文里提一句
+  // 「【Obsidian】」不该被切掉前半句
+  if (at >= 0 && looksInjected(s.slice(0, at))) {
+    s = s.slice(at + BODY_MARKER.length);
+  }
+  s = s.replace(TIME_BLOCK_RE, '').replace(TZ_LINE_RE, '').replace(ELAPSED_LINE_RE, '');
+  return s.trim();
+}
+
+// 这条消息该显示什么；null 表示整条不显示
+function displayTextOf(message) {
+  if (!message) return null;
+  const text = String(message.text == null ? '' : message.text);
+  if (message.role === 'user') {
+    // 摘要整条藏掉：它是给模型看的，主人要看的是对话
+    if (isCheckpoint(text)) return null;
+    const shown = stripInjected(text);
+    return shown ? shown : null;
+  }
+  // 助手的回复原样交给渲染器（只是去掉首尾空白），空的就不占位
+  const trimmed = text.trim();
+  return trimmed ? trimmed : null;
+}
+
+module.exports = { displayTextOf, stripInjected, isCheckpoint };
 
 });
 __define('lib/permissions.js', function (module, exports, require) {
@@ -3107,59 +3286,6 @@ function createRegistry(deps) {
 
 module.exports = { createRegistry, OPS };
 });
-__define('lib/reply-reconcile.js', function (module, exports, require) {
-'use strict';
-// Bridge · 面板回复对账
-//
-// 事件（SSE）是快路，但会丢：断线、重连窗口、那一轮压根没产生文本、
-// 或者事件名/结构变了。丢了之后面板就永远停在「思考中…」，看起来就是
-// 「agent 没回我」。
-//
-// 这里给一条慢路：只问会话真相（/sessions 的 running + /transcript 的消息），
-// 不看事件。只要那一轮真的跑完了，回复就能被捞出来补上。
-// 纯函数，不碰网络，好测。
-
-/** 面板里已经显示过的 assistant 文本集合（用来判断「这条补过没有」） */
-function shownAssistantTexts(shown) {
-  const set = new Set();
-  for (const m of Array.isArray(shown) ? shown : []) {
-    if (m && m.role === 'assistant' && typeof m.text === 'string') set.add(m.text);
-  }
-  return set;
-}
-
-/**
- * 该不该把某条回复补到面板上。
- * @param {Array} shown     面板已显示的消息（{role,text}）
- * @param {Array} transcript 会话日志里的最近消息（{role,text}）
- * @returns {{role:string,text:string}|null} 要补的那条；没得补就 null
- */
-function pickMissingReply(shown, transcript) {
-  const list = Array.isArray(transcript) ? transcript : [];
-  const last = [...list]
-    .reverse()
-    .find((m) => m && m.role === 'assistant' && typeof m.text === 'string' && m.text.trim());
-  if (!last) return null;
-  if (shownAssistantTexts(shown).has(last.text)) return null;
-  return { role: 'assistant', text: last.text };
-}
-
-/**
- * 现在该不该去对账。
- * @param {{running:boolean, waiting:boolean, elapsedMs:number, timeoutMs?:number}} input
- */
-function shouldReconcile({ running, waiting, elapsedMs, timeoutMs = 180000 } = {}) {
-  if (waiting !== true) return false;
-  if (!Number.isFinite(elapsedMs) || elapsedMs > timeoutMs) return false;
-  // 只有「明确已经停了」才对账：
-  // running=true（还在跑，事件可能只是慢）和 undefined（会话列表还没刷新，
-  // 查不到等于不知道）都不插手，免得误判成跑完、把机会让给一条旧回复。
-  return running === false;
-}
-
-module.exports = { pickMissingReply, shouldReconcile };
-
-});
 __define('lib/scroll-anchor.js', function (module, exports, require) {
 // Bridge · 回复进来时视口停在哪
 //
@@ -3504,6 +3630,50 @@ function startCoreServer(opts = {}) {
 }
 
 module.exports = { startCoreServer };
+});
+__define('lib/session-context.js', function (module, exports, require) {
+// Bridge · 切换会话时窗口里该显示什么
+//
+// 面板只显示「当前绑定会话」的对话。切会话时两件事容易出错：
+//   1. 上一条会话的历史请求还没回来，落到了新会话的窗口上——看起来像串台
+//   2. 历史回来了，但加载期间又有新消息到，直接覆盖就把它们丢了
+// 这两件事做成纯函数放这里，好测。
+
+// 一次拉多少条历史：切过去能接上话就够，多了只是拖慢渲染。
+const HISTORY_LIMIT = 10;
+
+// 这条历史该不该落到窗口上
+function transcriptState({ reqToken, curToken, reqSession, curSession } = {}) {
+  // 请求发出后又切过会话（token 变了）：哪怕切回来的是同一个会话也作废，
+  // 因为窗口已经按新会话重建过了
+  if (reqToken !== curToken) return 'stale';
+  // 会话对不上也作废；两边有一边不知道时只认 token，不无端丢历史
+  if (reqSession && curSession && reqSession !== curSession) return 'stale';
+  return 'apply';
+}
+
+// 历史打底；加载期间新到的消息接在后面，同一条不重复出现
+function mergeTranscript({ transcript, live } = {}) {
+  const out = (Array.isArray(transcript) ? transcript : []).filter(Boolean);
+  const extra = (Array.isArray(live) ? live : []).filter(Boolean);
+  for (const msg of extra) {
+    // 只看尾部几条：同一条消息的实时版和历史版总在末尾附近
+    const from = Math.max(0, out.length - 6);
+    let dup = false;
+    for (let i = from; i < out.length; i += 1) {
+      const seen = out[i];
+      if (seen && seen.role === msg.role && seen.text === msg.text) {
+        dup = true;
+        break;
+      }
+    }
+    if (!dup) out.push(msg);
+  }
+  return out;
+}
+
+module.exports = { HISTORY_LIMIT, transcriptState, mergeTranscript };
+
 });
 __define('lib/settings.js', function (module, exports, require) {
 'use strict';

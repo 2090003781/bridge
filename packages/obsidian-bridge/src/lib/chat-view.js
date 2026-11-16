@@ -6,8 +6,10 @@ const { ItemView, Notice, Modal, Setting, TFolder, MarkdownRenderer } = require(
 const fs = require('node:fs');
 const { parseLedger } = require('./ledger-reader.js');
 const { reconcileInjection } = require('./settings.js');
-const { pickMissingReply, shouldReconcile } = require('./reply-reconcile.js');
 const { pickReplyAnchor } = require('./scroll-anchor.js');
+const { HISTORY_LIMIT, transcriptState, mergeTranscript } = require('./session-context.js');
+const { rewriteLocalImages } = require('./image-embed.js');
+const { displayTextOf } = require('./panel-text.js');
 
 const VIEW_TYPE = 'bridge-chat';
 const RECENT_LIMIT = 15;
@@ -31,8 +33,9 @@ class BridgeChatView extends ItemView {
     this.pendingTimer = null;
     this.mergeWindowMs = 1500; // 最后一次输入后等这么久再合并发出
     this.sessionId = null;
+    // 每切一次会话 +1：历史请求靠它认住自己属于哪一次切换
+    this._switchToken = 0;
     this.ac = null;
-    this.sideTimer = null;
   }
 
   getViewType() {
@@ -59,7 +62,10 @@ class BridgeChatView extends ItemView {
     this.renderSide();
     this.renderChat();
 
-    this.sideTimer = setInterval(() => this.refreshRemoteState(), 5000);
+    // 不做定时轮询：窗口拿回焦点时对一次账（注入开关变了、或者断线期间漏了事件）
+    this.registerDomEvent(window, 'focus', () => {
+      this.refreshRemoteState();
+    });
 
     await this.ensureSession();
     this.refreshRemoteState();
@@ -67,14 +73,9 @@ class BridgeChatView extends ItemView {
 
   onClose() {
     if (this.pendingTimer) { clearTimeout(this.pendingTimer); this.pendingTimer = null; }
-    if (this._lineTimer) { clearInterval(this._lineTimer); this._lineTimer = null; }
     // 用户主动关掉面板：下次启动别再自己弹出来
     this.plugin.settings.chatOpen = false;
     this.plugin.persistSettings();
-    if (this.sideTimer) {
-      clearInterval(this.sideTimer);
-      this.sideTimer = null;
-    }
     this.disconnect();
   }
 
@@ -249,16 +250,39 @@ class BridgeChatView extends ItemView {
     return items.some((s) => s && s.sessionId === sessionId);
   }
 
+  // 切会话要换掉的不只是 id：窗口里的消息、流式缓冲、合并盒、
+  // 上一条会话的补回复轮询，全属于旧会话，一样都不该留在新会话里。
   bindSession(sessionId) {
     this.sessionId = sessionId;
     this.plugin.settings.chatSessionId = sessionId;
     this.plugin.saveSettings();
+    this._switchToken += 1;
+    this.stashPendingIntoInput();
     this.messages = [];
+    this.assistantBuffer = '';
+    // 切过去就该看到最新那几条，而不是停在旧会话滚到的位置
+    this._stickToBottom = true;
+    this._renderAnchor = 'bottom';
     this.render();
     this.setStatus('已连接');
     this.refreshLocalState();
     this.connect();
     this.loadHistory();
+  }
+
+  // 合并盒（攒着还没发的那几条）在切会话时清掉，但话得留着：
+  // 放回输入框，既不会丢，也不会误发到刚切过去的会话里。
+  stashPendingIntoInput() {
+    if (this.pendingTimer) {
+      clearTimeout(this.pendingTimer);
+      this.pendingTimer = null;
+    }
+    if (!this.pending.length) return;
+    const text = this.pending.join('\n');
+    this.pending = [];
+    if (!this.inputEl) return;
+    const current = String(this.inputEl.value || '');
+    this.inputEl.value = current.trim() ? current + '\n' + text : text;
   }
 
   // 拉会话列表 → 弹树（工作区 → 会话），选中就绑定
@@ -281,9 +305,9 @@ class BridgeChatView extends ItemView {
     new SessionTreeModal(this.app, items, this.sessionId, (sessionId) => {
       this.bindSession(sessionId);
       new Notice('已切换会话');
-      }, (workspaceId) => {
-        this.createAndBind(workspaceId);
-      }).open();
+    }, (workspaceId) => {
+      this.createAndBind(workspaceId);
+    }).open();
   }
 
   // 确保当前库目录在 DSH 里是一个工作区：没有就注册一个（标题用库名）。
@@ -328,17 +352,31 @@ class BridgeChatView extends ItemView {
     new Notice('已新建 Bridge 会话');
   }
 
-  // reload 后把会话里最近的消息读回来：面板自己不存历史，消息都在 DSH 那边
+  // 把会话里最近的消息读回来：面板自己不存历史，消息都在 DSH 那边。
+  // 切会话后也是靠它把窗口换成新会话的上下文，所以每次绑定都重拉一次，
+  // 并用切换序号认住「这次请求属于哪一次切换」——迟到的结果直接丢掉，
+  // 否则慢半拍的上一条会话历史会盖到新会话的窗口上。
   async loadHistory() {
     if (!this.sessionId) return;
+    const token = this._switchToken;
+    const sessionId = this.sessionId;
     try {
-      const res = await this.plugin.connector().transcript(this.sessionId, 20);
+      const res = await this.plugin.connector().transcript(sessionId, HISTORY_LIMIT);
       if (!res || res.ok !== true) return;
+      const verdict = transcriptState({
+        reqToken: token,
+        curToken: this._switchToken,
+        reqSession: sessionId,
+        curSession: this.sessionId,
+      });
+      if (verdict !== 'apply') return;
       const items = (res.data && res.data.messages) || [];
-      if (!items.length) return;
-      // 载入期间用户可能已经发过消息，别覆盖掉
-      if (this.messages.length > 0) return;
-      this.messages = items.map((m) => ({ role: m.role, text: m.text }));
+      // 日志里有什么拿什么：这一轮还没答完也没关系，
+      // 答完的内容会照常走事件补进来
+      const history = items.map((m) => ({ role: m.role, text: m.text }));
+      // 加载期间可能已经有新消息到了（自己刚发的、事件推来的）：
+      // 历史打底，把它们接在后面，同一条不重复
+      this.messages = mergeTranscript({ transcript: history, live: this.messages });
       this.render();
     } catch {
       /* 读历史失败不影响发消息 */
@@ -362,6 +400,8 @@ class BridgeChatView extends ItemView {
           if (this.ac === ac && !ac.signal.aborted && this.sessionId) {
             this.setStatus('重连中…');
             this.connect();
+            // 断线期间漏了什么不知道，重连后拉一次最近的消息兜住
+            this.loadHistory();
           }
         }, 3000);
       });
@@ -403,8 +443,6 @@ class BridgeChatView extends ItemView {
       return;
     }
     if (type === 'turn/end') {
-      // 事件到了就是快路通了，兜底可以退休
-      this.stopReplyWatch();
       if (this.assistantBuffer) {
         this.messages.push({ role: 'assistant', text: this.assistantBuffer });
         this.assistantBuffer = '';
@@ -412,12 +450,11 @@ class BridgeChatView extends ItemView {
       }
       this.render();
       this.setStatus('就绪');
-      this.refreshRecent();
       return;
     }
     if (type === 'tool-call') {
-      const name = event.data && (event.data.name || (event.data.toolCall && event.data.toolCall.name));
-      if (name) this.setStatus('执行：' + name);
+      // 工具名一次一换、跳得厉害；状态行只留一句「执行中」
+      this.setStatus('执行中…');
     }
   }
 
@@ -469,7 +506,6 @@ class BridgeChatView extends ItemView {
       mode: isSteer ? 'steer' : 'queue',
     });
     if (!res || res.ok !== true) {
-      this.stopReplyWatch();
       const raw = (res && res.error && res.error.message) || '发送失败';
       this.setStatus('发送失败');
       if (/resume failed|not found/i.test(raw)) {
@@ -484,57 +520,6 @@ class BridgeChatView extends ItemView {
     }
     // 投出去了：状态往前推一格，别一直停在「排队中」——那是在等投递，不是等回复。
     this.setStatus('已发出，等待回复…');
-    // 起一条慢路兜底。SSE 断线、事件漏收、或者那一轮压根没产生文本，
-    // 面板都会永远停在「思考中…」，看起来就是「agent 没回我」。
-    this.startReplyWatch();
-  }
-
-  // 投递后的对账：只问会话真相（/sessions 的 running + /transcript 的消息），
-  // 不看事件。只要那一轮真的跑完了，回复就能被捞出来补上。
-  startReplyWatch() {
-    this.stopReplyWatch();
-    const startedAt = Date.now();
-    this._waitingReply = true;
-    this.replyWatchTimer = setInterval(async () => {
-      const elapsedMs = Date.now() - startedAt;
-      if (elapsedMs > 180000) {
-        this.stopReplyWatch();
-        return;
-      }
-      let running;
-      try {
-        const list = await this.plugin.connector().sessions();
-        const items = (list && list.data && list.data.sessions) || [];
-        const mine = items.find((x) => x && x.sessionId === this.sessionId);
-        running = mine ? mine.running : undefined;
-      } catch {
-        running = undefined;
-      }
-      if (!shouldReconcile({ running, waiting: this._waitingReply === true, elapsedMs })) return;
-      try {
-        const t = await this.plugin.connector().transcript(this.sessionId, 6);
-        const msgs = (t && t.data && t.data.messages) || [];
-        const missing = pickMissingReply(this.messages, msgs);
-        if (missing) {
-          this.messages.push(missing);
-          this.render();
-          this.plugin.logEvent('chat', '事件没到，按会话日志补了一条回复');
-        }
-        this.setStatus('就绪');
-        this.stopReplyWatch();
-      } catch {
-        /* 下一拍再试 */
-      }
-    }, 3000);
-    this.register(() => this.stopReplyWatch());
-  }
-
-  stopReplyWatch() {
-    if (this.replyWatchTimer) {
-      clearInterval(this.replyWatchTimer);
-      this.replyWatchTimer = null;
-    }
-    this._waitingReply = false;
   }
 
   openInjectionPanel() {
@@ -603,12 +588,39 @@ class BridgeChatView extends ItemView {
     this.render();
   }
 
+  // 渲染用的基准路径：相对图片、相对附件按「正在看的那篇」解析。
+  // 空字符串会让相对路径全部解析失败，图就显示不出来。
+  sourcePathForRender() {
+    try {
+      const file = this.app.workspace.getActiveFile();
+      if (file && file.path) return file.path;
+    } catch {
+      /* 没有活动文件就退回库根 */
+    }
+    return '';
+  }
+
+  // 库外的本地绝对路径（agent 存的截图之类）Obsidian 不会自己去读，
+  // 先读成 data URL 再交给渲染器，图才真的显示出来。
+  prepareMarkdown(text) {
+    const body = String(text || '');
+    try {
+      return rewriteLocalImages(body, {
+        vaultRoot: this.app.vault.adapter.getBasePath(),
+        readFile: (target) => fs.readFileSync(target),
+      });
+    } catch {
+      return body;
+    }
+  }
+
   // Obsidian 自带渲染器；失败就退回纯文本，不能让一条消息把面板弄崩。
   renderMarkdown(el, text) {
+    const body = String(text || '');
     try {
-      MarkdownRenderer.render(this.app, String(text || ''), el, '', this);
+      MarkdownRenderer.render(this.app, this.prepareMarkdown(body), el, this.sourcePathForRender(), this);
     } catch {
-      el.setText(String(text || ''));
+      el.setText(body);
     }
   }
 
@@ -707,10 +719,13 @@ class BridgeChatView extends ItemView {
     const keepTop = this.listEl.scrollTop;
     this.listEl.empty();
     for (const msg of this.messages) {
+      // 时间戳、坐标行、压缩摘要这些不是主人敲的字：剥掉，剥空了就不占位
+      const shown = displayTextOf(msg);
+      if (!shown) continue;
       const el = this.listEl.createDiv({ cls: `bridge-msg bridge-msg-${msg.role}` });
-      // 助手回复按 Markdown 渲染（代码块、列表、粗体），用户自己的话保持纯文本
-      if (msg.role === 'assistant') this.renderMarkdown(el, msg.text);
-      else el.setText(msg.text);
+      // 助手回复按 Markdown 渲染（代码块、列表、图片），用户自己的话保持纯文本
+      if (msg.role === 'assistant') this.renderMarkdown(el, shown);
+      else el.setText(shown);
     }
     if (this.assistantBuffer) {
       const el = this.listEl.createDiv({ cls: 'bridge-msg bridge-msg-assistant bridge-msg-streaming' });
