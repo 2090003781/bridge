@@ -15,12 +15,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/2090003781/bridge.git",
+    "url": "git+https://github.com/Charliewhale/bridge.git",
     "directory": "packages/dsh-bridge-connector"
   },
-  "homepage": "https://github.com/2090003781/bridge/tree/main/packages/dsh-bridge-connector#readme",
+  "homepage": "https://github.com/Charliewhale/bridge/tree/main/packages/dsh-bridge-connector#readme",
   "bugs": {
-    "url": "https://github.com/2090003781/bridge/issues"
+    "url": "https://github.com/Charliewhale/bridge/issues"
   },
   "dsh": {
     "bundle": {

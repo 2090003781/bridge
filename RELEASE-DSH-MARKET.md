@@ -1,16 +1,16 @@
 # 发布到 DSH 插件市场
 
-仓库已经是一个 monorepo：`2090003781/bridge`，两个包在 `packages/` 下。
+仓库已经是一个 monorepo：`Charliewhale/bridge`，两个包在 `packages/` 下。
 
 ## 市场条目（现在应该是这个）
 
-文件：`data/plugins/2090003781__bridge--packages-dsh-bridge-connector.yml`
+文件：`data/plugins/Charliewhale__bridge--packages-dsh-bridge-connector.yml`
 
 ```yaml
-url: https://github.com/2090003781/bridge/tree/main/packages/dsh-bridge-connector
-name: 2090003781/bridge#dsh-bridge-connector
+url: https://github.com/Charliewhale/bridge/tree/main/packages/dsh-bridge-connector
+name: Charliewhale/bridge#dsh-bridge-connector
 category: remote
-tarball: https://github.com/2090003781/bridge/releases/latest/download/dsh-bridge-connector.tgz
+tarball: https://github.com/Charliewhale/bridge/releases/latest/download/dsh-bridge-connector.tgz
 description:
   en: Loopback HTTP/SSE service that lets an Obsidian plugin drive DSH sessions and tells the model where you are reading (path, size, cursor line, heading, selection — coordinates only, the note body stays on disk); gives the agent its own separate cursor inside the editor; the companion plugin must be running in Obsidian.
   zh: 让 Obsidian 插件驱动 DSH 会话、并把「你在读哪一篇、光标在哪」这类坐标交给模型的回环 HTTP/SSE 服务（只给坐标，正文留在磁盘上，需要时自己去读）；AI 在编辑器里有自己独立的光标；需要在 Obsidian 内配套运行插件。
@@ -44,8 +44,9 @@ npm publish --access public
 
 ## 历史
 
-- 2026-11-01：第一版条目合并（当时是两个独立仓库，指向 `2090003781/dsh-bridge-connector`）
-- 2026-11-02：合成 monorepo `2090003781/bridge`，旧的两个仓库删除，条目改指向子目录
+- 2026-11-01：第一版条目合并（当时是两个独立仓库，指向 `Charliewhale/dsh-bridge-connector`）
+- 2026-11-02：合成 monorepo `Charliewhale/bridge`，旧的两个仓库删除，条目改指向子目录
+- 2026-11-20：GitHub 账号改名（`2090003781` → `Charliewhale`），仓库链接与 npm 的 repository 字段跟着改；旧名字仍会被 301 重定向，但新文档统一用新名
 
 ## 流程
 

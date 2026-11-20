@@ -1,5 +1,5 @@
 # 提交 DSH 插件市场 PR（分支已经推好，只差这一步）
-# 前提：仓库 https://github.com/2090003781/dsh-bridge-connector 创建满 1 天（2026-11-01 16:21 之后）
+# 前提：仓库 https://github.com/Charliewhale/dsh-bridge-connector 创建满 1 天（2026-11-01 16:21 之后）
 # 代理：本机现在是直连，不再写死代理环境变量（之前那个 127.0.0.1:17891 已经关了）
 $ErrorActionPreference = "Stop"
 $gh = "C:\Users\20900\Tools\gh\bin\gh.exe"
@@ -22,6 +22,6 @@ Adds `dsh-bridge-connector`, a loopback HTTP/SSE service that lets an Obsidian p
 & $gh pr create `
   --repo awesome-dsh-plugin/awesome-dsh-plugin `
   --base main `
-  --head 2090003781:add-dsh-bridge-connector `
+  --head Charliewhale:add-dsh-bridge-connector `
   --title "Add dsh-bridge-connector" `
   --body $body

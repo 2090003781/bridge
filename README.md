@@ -13,13 +13,13 @@
 
 ## 装法
 
-**Obsidian 侧**：把 [release](https://github.com/2090003781/bridge/releases) 里的 `obsidian-bridge-<版本>.zip` 解压到
+**Obsidian 侧**：把 [release](https://github.com/Charliewhale/bridge/releases) 里的 `obsidian-bridge.zip`（资产名不带版本号） 解压到
 `你的库/.obsidian/plugins/obsidian-bridge/`，在第三方插件里启用。
 
 **DSH 侧**：
 
 ```sh
-dsh plugin --profile web add https://github.com/2090003781/bridge/releases/latest/download/dsh-bridge-connector.tgz
+dsh plugin --profile web add https://github.com/Charliewhale/bridge/releases/latest/download/dsh-bridge-connector.tgz
 ```
 
 装完重启 DSH。
