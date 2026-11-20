@@ -13,7 +13,7 @@ function tmpFile() {
 
 test('没有状态文件时返回 null，交给调用方回落到配置', () => {
   const store = createStateStore({ file: tmpFile() });
-  assert.deepEqual(store.load(), { injection: null, approvalModes: {} });
+  assert.deepEqual(store.load(), { injection: null });
 });
 
 test('保存后能读回来', () => {

@@ -400,19 +400,6 @@ class BridgeChatView extends ItemView {
     this.usageEl = bar.createDiv({ cls: 'bridge-composer-usage' });
     this.usageEl.setText('上下文 —');
 
-    // 审批三档：提示 / 批准（转发到这里点）/ 放行（自动通过）。点一下循环。
-    this.approvalBtn = bar.createEl('button', {
-      cls: 'bridge-composer-btn bridge-approval-btn',
-      text: '提示',
-    });
-    this._approvalMode = 'notify';
-    this.updateApprovalBtn();
-    this.approvalBtn.onClickEvent(() => this.cycleApprovalMode());
-
-    // 面板内批准：挂在这里的请求可以直接点允许/拒绝，不用切到 DSH 页面
-    this.approvalArea = inputWrap.createDiv({ cls: 'bridge-approval-area' });
-    this._approvals = [];
-
     // 回到底部：一开始禁用，往上翻历史时才亮起来
     this.jumpEl = bar.createEl('button', { cls: 'bridge-composer-btn bridge-jump-bottom', text: '↓' });
     this.jumpEl.title = '回到最底下';
@@ -505,7 +492,6 @@ class BridgeChatView extends ItemView {
     this.connect();
     this.loadHistory();
     this.refreshUsage();
-    this.refreshApprovals();
   }
 
   // 合并盒（攒着还没发的那几条）在切会话时清掉，但话得留着：
@@ -691,35 +677,6 @@ class BridgeChatView extends ItemView {
       this.refreshUsage();
       return;
     }
-    if (type === 'bridge/approval-request') {
-      const d = event.data || {};
-      const id = String(d.id || '');
-      const rest = (this._approvals || []).filter((x) => x.id !== id);
-      this._approvals = rest.concat([
-        { id, answerable: d.answerable === true, toolName: String(d.toolName || ''), reason: String(d.reason || '') },
-      ]);
-      this.renderPendingApprovals();
-      new Notice('Bridge 在等你批准：' + (d.toolName || '某个操作'), 8000);
-      return;
-    }
-    if (type === 'bridge/approval-decided') {
-      const d = event.data || {};
-      this._approvals = (this._approvals || []).filter((x) => x.id !== String(d.id || ''));
-      this.renderPendingApprovals();
-      return;
-    }
-    if (type === 'approval/asked') {
-      const d = event.data || {};
-      const tool = String(d.toolName || '某个操作');
-      const why = d.reason ? '：' + String(d.reason).slice(0, 160) : '';
-      new Notice('Bridge 在等你批准：' + tool + why, 8000);
-      this.refreshApprovals();
-      return;
-    }
-    if (type === 'approval/decided') {
-      this.refreshApprovals();
-      return;
-    }
     if (type === 'tool-call') {
       // 工具名一次一换、跳得厉害；状态行只留一句「执行中」
       this.setStatus('执行中…');
@@ -821,96 +778,7 @@ class BridgeChatView extends ItemView {
     await this.injectFile(file, selection);
   }
 
-  // 审批三档循环：只提示 → 面板批准 → 自动放行
-  async cycleApprovalMode() {
-    if (!this.sessionId) {
-      new Notice('还没有绑定会话');
-      return;
-    }
-    const order = ['notify', 'ask', 'auto'];
-    const next = order[(order.indexOf(this._approvalMode) + 1) % order.length];
-    const res = await this.plugin.connector().setApprovalMode(this.sessionId, next);
-    if (!res || res.ok !== true) {
-      new Notice('切换失败：连接器未响应（DSH 未启动或版本过旧）');
-      return;
-    }
-    this._approvalMode = (res.data && res.data.mode) || next;
-    this.updateApprovalBtn();
-    new Notice('Bridge 工具审批：' + this.approvalLabel(this._approvalMode));
-    this.refreshApprovals();
-  }
-
-  approvalLabel(mode) {
-    if (mode === 'auto') return '自动放行';
-    if (mode === 'ask') return '在面板里批准';
-    return '只提示';
-  }
-
-  updateApprovalBtn() {
-    if (!this.approvalBtn) return;
-    const mode = this._approvalMode || 'notify';
-    this.approvalBtn.setText(this.approvalLabel(mode));
-    this.approvalBtn.toggleClass('is-on', mode === 'auto');
-    this.approvalBtn.toggleClass('is-ask', mode === 'ask');
-    this.approvalBtn.title =
-      mode === 'auto'
-        ? '本会话的 Bridge 工具审批自动通过（点一下切到「只提示」）'
-        : mode === 'ask'
-          ? 'Bridge 工具审批转发到面板，由你点允许/拒绝'
-          : '只在面板里提示，不代为应答';
-  }
-
-  // 待批列表：面板内直接点允许/拒绝
-  renderPendingApprovals() {
-    const el = this.approvalArea;
-    if (!el) return;
-    el.empty();
-    if (!Array.isArray(this._approvals) || !this._approvals.length) return;
-    for (const item of this._approvals) {
-      const row = el.createDiv({ cls: 'bridge-approval-item' });
-      const text = row.createDiv({ cls: 'bridge-approval-text' });
-      text.createSpan({ cls: 'bridge-approval-tool', text: item.toolName || 'Bridge 工具' });
-      if (item.reason) text.createSpan({ cls: 'bridge-approval-reason', text: ' · ' + String(item.reason).slice(0, 120) });
-      if (item.answerable !== true) { text.createSpan({ cls: 'bridge-approval-hint', text: ' · 去 DSH 窗口批准' }); continue; }
-      const allow = row.createEl('button', { cls: 'bridge-approval-yes', text: '允许' });
-      allow.onClickEvent(() => this.answerApproval(item.id, 'allow'));
-      const deny = row.createEl('button', { cls: 'bridge-approval-no', text: '拒绝' });
-      deny.onClickEvent(() => this.answerApproval(item.id, 'deny'));
-    }
-  }
-
-  answerApproval(id, decision) {
-    return this.plugin
-      .connector()
-      .answerApproval(id, decision)
-      .then((res) => {
-        if (!res || res.ok !== true) {
-          new Notice((res && res.error && res.error.message) || '这个审批已经处理过或超时了');
-        }
-        this._approvals = (this._approvals || []).filter((x) => x.id !== id);
-        this.renderPendingApprovals();
-      })
-      .catch(() => {});
-  }
-
-  // 拉一次待批列表：有的话在面板里说清楚，别让人对着「卡住」发呆
-  refreshApprovals() {
-    const sessionId = this.sessionId;
-    if (!sessionId) return Promise.resolve();
-    return this.plugin
-      .connector()
-      .approvals(sessionId)
-      .then((res) => {
-        if (this.sessionId !== sessionId) return;
-        const data = (res && res.ok === true && res.data) || null;
-        if (!data) return;
-        if (data.mode) this._approvalMode = data.mode;
-        this._approvals = Array.isArray(data.pending) ? data.pending : [];
-        this.updateApprovalBtn();
-        this.renderPendingApprovals();
-      })
-      .catch(() => {});
-  }
+  // 注入面板里选的节奏：每几轮带一次、一共带几次
 
   // 上下文占用：窗口有多大、这次请求用了多少（数据来自连接器读会话日志）
   refreshUsage() {
@@ -950,8 +818,6 @@ class BridgeChatView extends ItemView {
         if (this.usageEl && this.sessionId === sessionId) this.usageEl.setText('上下文 —');
       });
   }
-
-  // 注入面板里选的节奏：每几轮带一次、一共带几次
   cadenceOfInject() {
     const s = this.plugin.settings || {};
     const every = Number(s.injectEvery);
@@ -1751,12 +1617,6 @@ function createConnectorClient(options = {}) {
     injectStatus: () => request('/inject'),
     // 上下文占用：窗口多大、现在用了多少
     usage: (sessionId) => request(`/usage?sessionId=${encodeURIComponent(sessionId)}`, { method: 'GET' }),
-    // 正在等审批的请求，以及「本会话自动放行 Obsidian 相关操作」的开关
-    approvals: (sessionId) => request(`/approvals?sessionId=${encodeURIComponent(sessionId)}`, { method: 'GET' }),
-    setApprovalMode: (sessionId, mode) =>
-      request('/approval/mode', { method: 'POST', body: { sessionId, mode } }),
-    answerApproval: (id, decision) =>
-      request('/approval/answer', { method: 'POST', body: { id, decision } }),
     clearInjection: (id) => request('/inject/clear', { method: 'POST', body: id ? { id } : {} }),
     // 当前打开的笔记：推给连接器，agent 不用等主人开口就知道屏幕上是什么。
     // path 传 null = 明确告诉连接器「现在没有打开的笔记」，别让旧的那篇一直挂着。

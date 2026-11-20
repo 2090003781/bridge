@@ -146,16 +146,6 @@ function publicSession(item, fileOf) {
 }
 
 
-/**
- * 从审批请求里取会话 id。请求带的是 agent，而 agent.session 才是会话本身，
- * agent.sessionId 根本不存在——照它取只会拿到空串，三档就全都不生效。
- */
-export function sessionIdOf(agent) {
-  if (!agent) return '';
-  const session = agent.session || null;
-  const id = agent.sessionId || (session && (session.id || session.sessionId)) || agent.id || '';
-  return String(id || '');
-}
 
 export function startConnector(options) {
   const {
@@ -171,56 +161,9 @@ export function startConnector(options) {
     workspaceRegistry = null,
     injectionState = { on: false },
     obsidianProbe = null,
-    approvalState = null,
   } = options;
 
-  // 审批三档（每会话）：notify 只提示 / ask 转发到面板等人点 / auto 直接放行。
-  // 默认 notify：不替主人做决定。
-  const APPROVAL_MODES = ['notify', 'ask', 'auto'];
-  const modeState = approvalState || { modeFor: () => 'notify', setMode: () => {} };
 
-  // 正在等审批的请求：approval/asked 进来、approval/decided 消掉。
-  const pendingApprovals = new Map(); // id -> { id, sessionId, toolName, reason, at }
-  // 挂起来等面板决定的请求：id -> { done }
-  const pendingDecisions = new Map();
-
-  // 「Bridge 工具」的判据：工具名去掉 mcp__<server>__ 前缀后以 obsidian_ 开头。
-  // 不靠理由里出现关键字——那个会误伤，前缀是硬约束（MCP 工具表里都带）。
-  function isBridgeTool(toolName) {
-    const name = String(toolName || '');
-    const rest = name.includes('__') ? name.slice(name.lastIndexOf('__') + 2) : name;
-    return rest.startsWith('obsidian_');
-  }
-
-  // DSH 先往日志里追加 approval/asked（带真实 id）再走 waterfall，
-  // 所以这时候 pendingApprovals 里已经有这一条了：用它的 id 应答，
-  // 面板点下去才和 DSH 那边对得上号。抢不到才退化成自造 id。
-  async function claimPending(sessionId, toolName, callId, ms) {
-    const deadline = Date.now() + (Number(ms) || 0);
-    for (;;) {
-      let best = null;
-      for (const row of pendingApprovals.values()) {
-        if (!row || pendingDecisions.has(row.id)) continue;
-        if (sessionId && row.sessionId !== sessionId) continue;
-        if (callId && row.callId && row.callId !== callId) continue;
-        if (!callId && row.toolName !== toolName) continue;
-        if (!best || row.at >= best.at) best = row;
-      }
-      if (best) return best.id;
-      if (Date.now() >= deadline) break;
-      await new Promise((r) => setTimeout(r, 10));
-    }
-    const id = 'appr-' + crypto.randomBytes(6).toString('hex');
-    pendingApprovals.set(id, {
-      id,
-      sessionId: String(sessionId || ''),
-      toolName: String(toolName || ''),
-      callId: String(callId || ''),
-      reason: '',
-      at: Date.now(),
-    });
-    return id;
-  }
 
   // 投递前现查 Obsidian 的光标：本地回环一次几毫秒，比等推送精确。
   const probe = obsidianProbe || createObsidianProbe();
@@ -744,60 +687,6 @@ export function startConnector(options) {
       return;
     }
 
-    // 正在等审批的请求 + 当前档位
-    if (req.method === 'GET' && path === '/approvals') {
-      const sessionId = String(url.searchParams.get('sessionId') || '').trim();
-      const list = [...pendingApprovals.values()].filter((x) => !sessionId || x.sessionId === sessionId);
-      json(res, 200, {
-        ok: true,
-        data: { pending: list.map((x) => ({ ...x, answerable: pendingDecisions.has(x.id) })), mode: modeState.modeFor(sessionId), modes: APPROVAL_MODES },
-      });
-      return;
-    }
-
-    // 切换审批档位：notify / ask / auto
-    if (req.method === 'POST' && path === '/approval/mode') {
-      const payload = await readJsonBody(req, res);
-      if (!payload) return;
-      const sessionId = String(payload.sessionId || '').trim();
-      const mode = String(payload.mode || '').trim();
-      if (!sessionId) {
-        json(res, 400, { ok: false, error: { code: 'bad-args', message: '缺少 sessionId' } });
-        return;
-      }
-      if (!APPROVAL_MODES.includes(mode)) {
-        json(res, 400, { ok: false, error: { code: 'bad-args', message: 'mode 只能是 ' + APPROVAL_MODES.join(' / ') } });
-        return;
-      }
-      modeState.setMode(sessionId, mode);
-      // 切到自动放行时，把这一会话已经挂着的提示清掉，别留着一条点不动的。
-      if (mode === 'auto') {
-        for (const [key, row] of pendingApprovals) {
-          if (row && row.sessionId === sessionId) pendingApprovals.delete(key);
-        }
-      }
-      json(res, 200, { ok: true, data: { sessionId, mode } });
-      return;
-    }
-
-    // 面板上点了「允许 / 拒绝」：把挂着的那个请求放行
-    if (req.method === 'POST' && path === '/approval/answer') {
-      const payload = await readJsonBody(req, res);
-      if (!payload) return;
-      const id = String(payload.id || '').trim();
-      const decision = String(payload.decision || '').trim();
-      const entry = pendingDecisions.get(id);
-      if (!entry) {
-        if (pendingApprovals.has(id)) { json(res, 409, { ok: false, error: { code: 'not-decidable', message: '这一档没把请求交给面板，请到 DSH 窗口里批准' } }); return; }
-        json(res, 404, { ok: false, error: { code: 'not-found', message: '这个审批已经处理过或超时了' } });
-        return;
-      }
-      const outcome = decision === 'allow' ? 'allowed-once' : 'rejected';
-      entry.done(outcome);
-      json(res, 200, { ok: true, data: { id, outcome } });
-      return;
-    }
-
     if (req.method === 'GET' && path === '/events') {
       const sessionId = String(url.searchParams.get('sessionId') || '').trim();
       if (!sessionId) {
@@ -846,90 +735,6 @@ export function startConnector(options) {
         port: actualPort,
         url: `http://${host}:${actualPort}`,
         broadcast,
-        // 会话事件进来时记一笔：审批请求进表、决定出表
-        noteEvent(sessionId, event) {
-          try {
-            const type = event && event.type;
-            const data = (event && event.data) || {};
-            if (type === 'approval/asked') {
-              const id = String(data.id || '');
-              if (!id) return true;
-              // 自动放行档下，Bridge 工具的审批连痕迹都不留：不进列表、也不推给面板。
-              if (isBridgeTool(data.toolName) && modeState.modeFor(String(sessionId || '')) === 'auto') return false;
-              pendingApprovals.set(id, {
-                id,
-                sessionId: String(sessionId || ''),
-                toolName: String(data.toolName || ''),
-                callId: String(data.callId || ''),
-                reason: String(data.reason || ''),
-                at: Date.now(),
-              });
-              return true;
-            }
-            if (type === 'approval/decided') {
-              const id = String(data.id || '');
-              if (id) {
-                pendingApprovals.delete(id);
-                // 我们挂住的那条要是被别处先定了（中断/超时/别的应答者），
-                // 必须立刻把 promise 结掉，否则整个 waterfall 就永远挂着。
-                const held = pendingDecisions.get(id);
-                if (held && typeof held.done === 'function') held.done(String(data.outcome || 'cancelled'));
-                else pendingDecisions.delete(id);
-              }
-            }
-            return true;
-          } catch {
-            /* 记事件绝不影响会话 */
-            return true;
-          }
-        },
-        approvals: {
-          pendingFor: (sessionId) =>
-            [...pendingApprovals.values()].filter((x) => !sessionId || x.sessionId === sessionId),
-          modeFor: (sessionId) => modeState.modeFor(String(sessionId || '')),
-          setMode: (sessionId, mode) => modeState.setMode(String(sessionId || ''), mode),
-          isBridgeTool,
-          /**
-           * 把请求挂住、推到面板等人决定；超时就返回 null（交回下一个应答者）。
-           * 返回 'allowed-once' | 'rejected' | null。
-           */
-          async requestDecision(sessionId, req, timeoutMs = 180000) {
-            const id = await claimPending(
-              String(sessionId || ''),
-              String((req && req.toolName) || ''),
-              req && req.callId !== void 0 ? String(req.callId) : '',
-              400
-            );
-            return new Promise((resolve) => {
-              const done = (outcome) => {
-                if (!pendingDecisions.has(id)) return;
-                pendingDecisions.delete(id);
-                pendingApprovals.delete(id);
-                clearTimeout(timer);
-                broadcast(sessionId, { type: 'bridge/approval-decided', data: { id } });
-                resolve(outcome);
-              };
-              const timer = setTimeout(() => {
-                if (!pendingDecisions.has(id)) return;
-                pendingDecisions.delete(id);
-                pendingApprovals.delete(id);
-                broadcast(sessionId, { type: 'bridge/approval-decided', data: { id, timeout: true } });
-                resolve(null);
-              }, Math.max(1000, Number(timeoutMs) || 180000));
-              if (typeof timer.unref === 'function') timer.unref();
-              pendingDecisions.set(id, { done });
-              broadcast(sessionId, {
-                type: 'bridge/approval-request',
-                data: {
-                  id,
-                  answerable: true,
-                  toolName: String((req && req.toolName) || ''),
-                  reason: String((req && req.reason) || ''),
-                },
-              });
-            });
-          },
-        },
         injections: injectionStore,
         injectionState,
         activeNote: activeNoteOf,

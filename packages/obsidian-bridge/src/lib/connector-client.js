@@ -150,12 +150,6 @@ function createConnectorClient(options = {}) {
     injectStatus: () => request('/inject'),
     // 上下文占用：窗口多大、现在用了多少
     usage: (sessionId) => request(`/usage?sessionId=${encodeURIComponent(sessionId)}`, { method: 'GET' }),
-    // 正在等审批的请求，以及「本会话自动放行 Obsidian 相关操作」的开关
-    approvals: (sessionId) => request(`/approvals?sessionId=${encodeURIComponent(sessionId)}`, { method: 'GET' }),
-    setApprovalMode: (sessionId, mode) =>
-      request('/approval/mode', { method: 'POST', body: { sessionId, mode } }),
-    answerApproval: (id, decision) =>
-      request('/approval/answer', { method: 'POST', body: { id, decision } }),
     clearInjection: (id) => request('/inject/clear', { method: 'POST', body: id ? { id } : {} }),
     // 当前打开的笔记：推给连接器，agent 不用等主人开口就知道屏幕上是什么。
     // path 传 null = 明确告诉连接器「现在没有打开的笔记」，别让旧的那篇一直挂着。
