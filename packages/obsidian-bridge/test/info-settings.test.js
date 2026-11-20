@@ -103,3 +103,24 @@ test('token 有效期默认永久，垃圾值也当永久', () => {
   assert.equal(normalizeSettings({ tokenTtl: 'abc' }).tokenTtl, 0);
   assert.equal(normalizeSettings({ tokenTtl: 86400000 }).tokenTtl, 86400000);
 });
+
+test('注入节奏：间隔默认每次，次数默认不限期，值都收得住', () => {
+  assert.equal(DEFAULTS.injectEvery, 1);
+  assert.equal(DEFAULTS.injectTimes, 0);
+  const d = normalizeSettings(undefined);
+  assert.equal(d.injectEvery, 1);
+  assert.equal(d.injectTimes, 0);
+
+  assert.equal(normalizeSettings({ injectEvery: 3 }).injectEvery, 3);
+  assert.equal(normalizeSettings({ injectEvery: 0 }).injectEvery, 1);
+  assert.equal(normalizeSettings({ injectEvery: -2 }).injectEvery, 1);
+  assert.equal(normalizeSettings({ injectEvery: 2.9 }).injectEvery, 2);
+  assert.equal(normalizeSettings({ injectEvery: 1000 }).injectEvery, 99);
+  assert.equal(normalizeSettings({ injectEvery: 'x' }).injectEvery, 1);
+
+  assert.equal(normalizeSettings({ injectTimes: 1 }).injectTimes, 1);
+  assert.equal(normalizeSettings({ injectTimes: 5 }).injectTimes, 5);
+  assert.equal(normalizeSettings({ injectTimes: 1000 }).injectTimes, 99);
+  assert.equal(normalizeSettings({ injectTimes: -3 }).injectTimes, 0);
+  assert.equal(normalizeSettings({ injectTimes: 'x' }).injectTimes, 0);
+});

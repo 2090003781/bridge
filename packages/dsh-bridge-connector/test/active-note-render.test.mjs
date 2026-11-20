@@ -16,7 +16,7 @@ test('只有路径也能看懂，并且明确说不带正文', () => {
   assert.match(text, /正文未附/);
 });
 
-test('篇幅、修改时间、光标、小节都写出来', () => {
+test('篇幅和修改时间写出来，光标和小节一概不提', () => {
   const text = renderActiveNote({
     path: '项目/架构说明.md',
     title: '架构说明',
@@ -30,9 +30,10 @@ test('篇幅、修改时间、光标、小节都写出来', () => {
   assert.match(text, /架构说明/);
   assert.match(text, /7083 字 \/ 201 行/);
   assert.match(text, /改于 2026-11-08 19:42/);
-  // 行号对外从 1 数起
-  assert.match(text, /光标在第 100 行第 5 列/);
-  assert.match(text, /，小节「## 2\.4 点亮判据」/);
+  // 光标位置彻底不报了：指着哪一句交给标记
+  assert.doesNotMatch(text, /光标/);
+  assert.doesNotMatch(text, /小节/);
+  assert.doesNotMatch(text, /第 100 行/);
 });
 
 test('选区有范围、字数、开头预览', () => {
@@ -87,44 +88,95 @@ test('路径里的换行和多余空白被压平，不破坏提示词结构', ()
 });
 
 
-// ── 光标那一行：每轮都带，所以必须短、必须永远有个说法 ──
-import { renderCursorLine } from '../src/core/active-note.mjs';
+// ── 标记那一行：只有真指着什么才带，且必须短 ──
+import { renderMarksLine, marksKeyOf } from '../src/core/active-note.mjs';
 
-test('光标行写明位置和小节', () => {
-  const line = renderCursorLine({
+test('有标记就报一行，没有就不说', () => {
+  const withMark = renderMarksLine({
     path: '项目/架构说明.md',
     title: '架构说明',
-    lineCount: 201,
-    cursor: { line: 99, ch: 4 },
-    heading: '## 2.4 点亮判据',
-    checked: true,
+    regions: [{ from: { line: 33, ch: 120 }, to: { line: 33, ch: 151 } }],
   });
-  assert.match(line, /^【光标】架构说明/);
-  assert.match(line, /在第 100 行第 5 列/);
-  assert.match(line, /小节「## 2\.4 点亮判据」/);
-  assert.match(line, /没有选中文字/);
-  assert.ok(line.split('\n').length === 1, '必须是一行，不能撑开');
+  assert.match(withMark, /^【标记】架构说明/);
+  assert.match(withMark, /区域 1 处：第 34 行/);
+  assert.doesNotMatch(withMark, /光标/);
+
+  assert.equal(renderMarksLine({ path: 'a.md', regions: [] }), '');
+  assert.equal(renderMarksLine({ path: 'a.md' }), '');
 });
 
-test('有选区就说选着哪几行', () => {
-  const line = renderCursorLine({
+test('点标记和区域可以同时存在，各报各的', () => {
+  const line = renderMarksLine({
     path: 'a.md',
-    cursor: { line: 9, ch: 0 },
+    title: 'A',
+    point: { line: 4, ch: 0 },
+    regions: [
+      { from: { line: 9, ch: 0 }, to: { line: 11, ch: 0 } },
+      { from: { line: 20, ch: 0 }, to: { line: 21, ch: 0 } },
+    ],
+  });
+  assert.match(line, /标记第 5 行第 1 列/);
+  assert.match(line, /区域 2 处：第 10→12 行、第 21→22 行/);
+});
+
+test('标记行不再带光标，也不带小节', () => {
+  const line = renderMarksLine({
+    path: 'a.md',
+    title: 'A',
+    cursor: { line: 2, ch: 0 },
+    heading: '## 某节',
+    point: { line: 15, ch: 0 },
+  });
+  assert.match(line, /标记第 16 行/);
+  assert.doesNotMatch(line, /光标/);
+  assert.doesNotMatch(line, /小节/);
+  assert.ok(line.split('\n').length === 1, '必须是一行');
+});
+
+test('有选区也算「指着一段」，跟着标记一起说', () => {
+  const line = renderMarksLine({
+    path: 'a.md',
     selection: { fromLine: 8, fromCh: 0, toLine: 12, toCh: 3, chars: 36 },
     checked: true,
   });
   assert.match(line, /选中第 9→13 行（36 字）/);
-  assert.doesNotMatch(line, /没有选中文字/);
 });
 
-test('拿不到光标就明说拿不到，不沉默', () => {
-  const line = renderCursorLine({ path: 'a.md', cursor: null, checked: true });
-  assert.match(line, /光标位置未知/);
+test('标记被清掉时明说一句，别让人以为还指着', () => {
+  const line = renderMarksLine({ path: 'a.md', title: 'A', regions: [] }, { cleared: true });
+  assert.match(line, /^【标记】A/);
+  assert.match(line, /标记已清除/);
 });
 
-test('没有打开的笔记也说一声', () => {
-  assert.match(renderCursorLine(null), /没有打开的笔记/);
-  assert.match(renderCursorLine({}), /没有打开的笔记/);
+test('没有笔记时不出声', () => {
+  assert.equal(renderMarksLine(null), '');
+  assert.equal(renderMarksLine({}), '');
+});
+
+test('只有选区没有标记：指纹也不为空，也要报一次', () => {
+  const key = marksKeyOf({
+    path: 'a.md',
+    regions: [],
+    selection: { fromLine: 1, fromCh: 0, toLine: 2, toCh: 3 },
+  });
+  assert.notEqual(key, '');
+  assert.notEqual(
+    key,
+    marksKeyOf({ path: 'a.md', regions: [], selection: { fromLine: 5, fromCh: 0, toLine: 6, toCh: 0 } })
+  );
+});
+
+test('标记指纹：同样的标记指纹相同，换行就不同', () => {
+  const a = marksKeyOf({ path: 'a.md', point: { line: 1, ch: 0 } });
+  const b = marksKeyOf({ path: 'a.md', point: { line: 1, ch: 0 } });
+  const c = marksKeyOf({ path: 'a.md', point: { line: 2, ch: 0 } });
+  assert.equal(a, b);
+  assert.notEqual(a, c);
+  assert.equal(marksKeyOf({ path: 'a.md', regions: [] }), '');
+  // 区域换了也算变
+  const r1 = marksKeyOf({ path: 'a.md', regions: [{ from: { line: 1, ch: 0 }, to: { line: 2, ch: 0 } }] });
+  const r2 = marksKeyOf({ path: 'a.md', regions: [{ from: { line: 1, ch: 0 }, to: { line: 3, ch: 0 } }] });
+  assert.notEqual(r1, r2);
 });
 
 
@@ -136,43 +188,38 @@ test('另外还开着的笔记会列出来，让他知道还有别的参考物',
 test('没有别的笔记时就不提这一句', () => {
   const text = renderActiveNote({ path: 'a.md', cursor: { line: 0, ch: 0 }, others: [] });
   assert.doesNotMatch(text, /另外开着/);
-});test('光标行在焦点正常时不加那句', () => {
-  const line = renderCursorLine({ path: 'a.md', cursor: { line: 9, ch: 0 }, focused: true, checked: true });
-  assert.doesNotMatch(line, /最后处在/);
 });
 
 
 // ── 临时标记：代替「指着某一段问你」 ──
 test('一个标记说清楚落在哪一行哪一列', () => {
-  const text = renderActiveNote({ path: 'a.md', cursor: { line: 0, ch: 0 }, marks: [{ line: 9, ch: 4 }] });
+  const text = renderActiveNote({ path: 'a.md', point: { line: 9, ch: 4 } });
   assert.match(text, /标记第 10 行第 5 列/);
 });
 
 test('两个标记说成范围', () => {
   const text = renderActiveNote({
     path: 'a.md',
-    cursor: { line: 0, ch: 0 },
-    marks: [{ line: 9, ch: 0 }, { line: 20, ch: 0 }],
+    regions: [{ from: { line: 9, ch: 0 }, to: { line: 20, ch: 0 } }],
   });
-  assert.match(text, /标记第 10 → 21 行/);
+  assert.match(text, /区域 1 处：第 10→21 行/);
 });
 
 test('同一行的范围不写两遍行号', () => {
   const text = renderActiveNote({
     path: 'a.md',
-    cursor: { line: 0, ch: 0 },
-    marks: [{ line: 9, ch: 0 }, { line: 9, ch: 6 }],
+    regions: [{ from: { line: 9, ch: 0 }, to: { line: 9, ch: 6 } }],
   });
-  assert.match(text, /标记第 10 行/);
+  assert.match(text, /区域 1 处：第 10 行/);
   assert.doesNotMatch(text, /→/);
 });
 
 test('没有标记时一个字都不提', () => {
-  const text = renderActiveNote({ path: 'a.md', cursor: { line: 0, ch: 0 }, marks: [] });
+  const text = renderActiveNote({ path: 'a.md', regions: [] });
   assert.doesNotMatch(text, /标记/);
 });
 
-test('每轮那行也带标记', () => {
-  const line = renderCursorLine({ path: 'a.md', title: 'A', cursor: { line: 2, ch: 0 }, marks: [{ line: 15, ch: 0 }] });
+test('标记行也带标记', () => {
+  const line = renderMarksLine({ path: 'a.md', title: 'A', point: { line: 15, ch: 0 } });
   assert.match(line, /标记第 16 行/);
 });

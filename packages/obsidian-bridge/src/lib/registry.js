@@ -3,6 +3,8 @@
 // 每个操作 = 一个入口：id / tier（read|write|trust）/ summary / run(ctx)
 // run 只通过注入的 obsidian（真实 app 或 fake）碰 Obsidian，便于脱离 Obsidian 测试。
 
+const { pickVisibleView } = require('./visible-view.js');
+
 function opError(code, message) {
   const err = new Error(message);
   err.code = code;
@@ -28,24 +30,26 @@ function screenEditor(obsidian) {
   const active = activeEditor(obsidian);
   if (active && active.file) return { ...active, focused: true };
 
-  // 走主编辑区的 active leaf，而不是 getLeavesOfType 的末位——
-  // 后者把后台标签也算进来，顺序还不是 z 序，可能拿到看不见的那篇。
-  const hits = [];
-  const walk = (node, depth) => {
-    if (!node || depth > 8) return;
-    if (typeof node.getActiveLeaf === 'function') {
-      const leaf = node.getActiveLeaf();
-      const v = leaf && leaf.view;
-      if (v && v.editor && v.file) hits.push(v);
-    }
-    for (const child of node.children || []) walk(child, depth + 1);
-  };
+  // 按「标签组当前选中的那一页」认，而不是按焦点历史：
+  // 焦点跑丢到面板输入框后，活动 leaf 记的还是你上次点过的那页，
+  // 和眼睛看到的那篇可能不是同一个（这就是「我在简历里，它说原则区」的由来）。
+  let preferred = null;
   try {
-    walk(ws.rootSplit, 0);
+    const root = ws.rootSplit;
+    const leaf = root && typeof root.getActiveLeaf === 'function' ? root.getActiveLeaf() : null;
+    preferred = (leaf && leaf.view) || null;
   } catch {
     /* 布局在重建 */
   }
-  if (hits[0]) return { view: hits[0], editor: hits[0].editor, file: hits[0].file, focused: false };
+  let visible = null;
+  try {
+    visible = pickVisibleView(ws.rootSplit, (v) => Boolean(v && v.editor && v.file), preferred);
+  } catch {
+    /* 布局在重建 */
+  }
+  if (visible) {
+    return { view: visible, editor: visible.editor, file: visible.file, focused: false };
+  }
 
   // 兜底：至少还有开着的 markdown
   const leaves = typeof ws.getLeavesOfType === 'function' ? ws.getLeavesOfType('markdown') : [];

@@ -107,16 +107,17 @@ test('第一次提问带上坐标，同一篇第二次就不带了', async (t) =
   await sendTask(ctx, { sessionId: 's1', message: '这句什么意思' });
   const first = lastPromptText(ctx);
   assert.match(first, /【Obsidian 当前窗口】架构说明 · 项目\/架构说明\.md/);
-  assert.match(first, /光标在第 128 行第 5 列/);
-  assert.match(first, /，小节「## 2\.4 点亮判据」/);
   assert.match(first, /正文未附/);
   assert.match(first, /【Obsidian】这句什么意思/);
+  // 光标位置一概不报
+  assert.doesNotMatch(first, /光标/);
+  assert.doesNotMatch(first, /小节/);
 
   await sendTask(ctx, { sessionId: 's1', message: '继续说' });
   const second = lastPromptText(ctx);
   assert.doesNotMatch(second, /【Obsidian 当前窗口】/, '整篇坐标只该给一次');
-  assert.match(second, /【光标】/, '光标每轮都要有');
-  assert.match(second, /第 128 行第 5 列/);
+  assert.doesNotMatch(second, /【光标】/);
+  assert.doesNotMatch(second, /【标记】/, '没标记就不该补行');
   assert.match(second, /【Obsidian】继续说/);
 });
 
@@ -148,8 +149,9 @@ test('没有打开笔记时消息保持原样，不塞空壳', async (t) => {
   const ctx = await boot();
   t.after(() => ctx.server.close());
   await sendTask(ctx, { sessionId: 's1', message: '你好' });
-  // 没有笔记也要说一声「没有」，不能沉默
-  assert.match(lastPromptText(ctx), /【光标】没有打开的笔记/);
+  // 没有笔记就什么都不塞；光标已经不再播报
+  assert.doesNotMatch(lastPromptText(ctx), /【光标】/);
+  assert.doesNotMatch(lastPromptText(ctx), /【标记】/);
   assert.match(lastPromptText(ctx), /【Obsidian】你好/);
 });
 
@@ -165,18 +167,18 @@ test('同一会话连发三轮，只第一轮带坐标', async (t) => {
   const calls = ctx.sessions.calls.filter((c) => c[0] === 'prompt');
   const full = calls.filter((c) => /【Obsidian 当前窗口】/.test(c[1].content[0].text));
   assert.equal(full.length, 1, '整篇坐标三轮只该带一次');
-  // 第一轮的光标写在整篇块里，第二三轮是单独的光标行——三轮都得有光标
-  const withCursor = calls.filter((c) => /光标在|最后处在|【光标】/.test(c[1].content[0].text));
-  assert.equal(withCursor.length, 3, '光标每轮都要有');
+  // 没有标记的这三轮：除了第一轮的整篇块，一句位置信息都不该有
+  const withCursor = calls.filter((c) => /光标|小节/.test(c[1].content[0].text));
+  assert.equal(withCursor.length, 0, '光标位置不再出现在提示词里');
 });
 
-test('现查成功时以现查的光标为准，压过推送缓存', async (t) => {
+test('现查成功时以现查那篇为准，压过推送缓存', async (t) => {
   const ctx = await boot({
     probe: {
       editorState: async () => ({
         ok: true,
         data: {
-          path: '项目/架构说明.md',
+          path: '项目/现查篇.md',
           mode: 'source',
           cursor: { line: 42, ch: 7 },
           selection: null,
@@ -187,13 +189,13 @@ test('现查成功时以现查的光标为准，压过推送缓存', async (t) =
   });
   t.after(() => ctx.server.close());
 
-  // 推送缓存里光标在第 128 行；现查说第 43 行 —— 应当信现查
+  // 推送缓存里是架构说明；现查说现在开着的是「现查篇」—— 应当信现查
   await pushNote(ctx, note());
   await sendTask(ctx, { sessionId: 's1', message: '看这里' });
 
   const text = lastPromptText(ctx);
-  assert.match(text, /第 43 行第 8 列/);
-  assert.doesNotMatch(text, /第 128 行/);
+  assert.match(text, /现查篇/);
+  assert.doesNotMatch(text, /架构说明/, '缓存里那篇不该顶上来');
 });
 
 test('现查明确说没有打开的笔记，就不带坐标', async (t) => {
@@ -205,7 +207,33 @@ test('现查明确说没有打开的笔记，就不带坐标', async (t) => {
 
   const text = lastPromptText(ctx);
   assert.doesNotMatch(text, /【Obsidian 当前窗口】/);
-  assert.match(text, /没有打开的笔记/);
+  assert.doesNotMatch(text, /【光标】/);
+  assert.match(text, /【Obsidian】你好/);
+});
+
+test('标记变了才补一行，清掉时明说一句', async (t) => {
+  const ctx = await boot();
+  t.after(() => ctx.server.close());
+
+  await pushNote(ctx, note({ regions: [{ from: { line: 33, ch: 120 }, to: { line: 33, ch: 151 } }] }));
+  await sendTask(ctx, { sessionId: 's1', message: '这一句帮我改' });
+  const first = lastPromptText(ctx);
+  assert.match(first, /区域 1 处：第 34 行/, '第一轮整篇块里就该带标记');
+  assert.doesNotMatch(first, /光标/);
+
+  // 标记没动：不该重复报
+  await sendTask(ctx, { sessionId: 's1', message: '再来' });
+  assert.doesNotMatch(lastPromptText(ctx), /【标记】/);
+
+  // 挪到另一行：补一行
+  await pushNote(ctx, note({ point: { line: 40, ch: 0 } }));
+  await sendTask(ctx, { sessionId: 's1', message: '改成这里' });
+  assert.match(lastPromptText(ctx), /【标记】.*标记第 41 行/);
+
+  // 清掉标记：说一声，免得以为还指着
+  await pushNote(ctx, note({ point: null, regions: [] }));
+  await sendTask(ctx, { sessionId: 's1', message: '好了' });
+  assert.match(lastPromptText(ctx), /标记已清除/);
 });
 
 test('others 会被规整保留', async (t) => {

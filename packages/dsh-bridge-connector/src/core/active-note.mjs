@@ -4,11 +4,12 @@
 // 每轮都要重发一遍，既贵、又把真正要说的话挤掉；而且模型拿到的是一份
 // 可能已经过期的副本，比「知道它在哪、自己去读」更容易出错。
 //
-// 这里回答四件事：当前窗口是哪一篇、多大、光标在哪、那一节叫什么。
+// 这里回答三件事：当前窗口是哪一篇、多大、有没有用标记指着哪里。
+// 光标位置一概不报——指着哪一段由标记（Ctrl/Cmd+Shift+M 打的工字形）来说，
+// 光标是「打字的地方」，不是「想让你看的地方」，混在一起只会误判。
 // 措辞按「简洁到能一眼扫完」为准——这些东西每轮都要占提示词。
 
 const MAX_SELECTION_PREVIEW = 240;
-const MAX_HEADING = 120;
 
 function flat(text) {
   return String(text == null ? '' : text)
@@ -29,27 +30,28 @@ const humanLine = (n) => (Number.isFinite(n) ? Number(n) + 1 : null);
 
 const shortName = (note) => cut(note.title || note.path, 60);
 
-/** 光标那一句：直接说在第几行第几列。 */
-function cursorPhrase(note, withPrefix = true) {
-  const cursor = note.cursor;
-  if (!cursor || !Number.isFinite(cursor.line)) return '光标位置未知';
-  const where = '在第 ' + humanLine(cursor.line) + ' 行';
-  let out = (withPrefix ? '光标' : '') + where;
-  if (Number.isFinite(cursor.ch)) out += '第 ' + (Number(cursor.ch) + 1) + ' 列';
-  return out;
-}
-
-/** 标记那一句：一个说点，两个说范围。没有标记就不说。 */
+/**
+ * 标记那一句：一个点 + 若干处区域，各说各的；都没有就不说。
+ * 点 → 「标记第 N 行第 M 列」；区域 → 「区域 2 处：第 2→4 行、第 11 行」
+ */
 function marksPhrase(note) {
-  const marks = Array.isArray(note.marks) ? note.marks : [];
-  if (!marks.length) return '';
-  if (marks.length === 1) {
-    const m = marks[0];
-    return '标记第 ' + humanLine(m.line) + ' 行第 ' + ((m.ch || 0) + 1) + ' 列';
+  const out = [];
+  const p = note.point;
+  if (p && Number.isFinite(p.line)) {
+    out.push('标记第 ' + humanLine(p.line) + ' 行第 ' + ((Number(p.ch) || 0) + 1) + ' 列');
   }
-  const a = humanLine(marks[0].line);
-  const b = humanLine(marks[1].line);
-  return '标记第 ' + a + (a === b ? ' 行' : ' → ' + b + ' 行');
+  const regions = (Array.isArray(note.regions) ? note.regions : []).filter(
+    (r) => r && r.from && Number.isFinite(r.from.line) && r.to && Number.isFinite(r.to.line)
+  );
+  if (regions.length) {
+    const each = regions.map((r) => {
+      const a = humanLine(r.from.line);
+      const b = humanLine(r.to.line);
+      return a === b ? '第 ' + a + ' 行' : '第 ' + a + '→' + b + ' 行';
+    });
+    out.push('区域 ' + regions.length + ' 处：' + each.join('、'));
+  }
+  return out.join('；');
 }
 
 /** 选区那一句：有就报范围和字数，确认过没有就说没有。 */
@@ -83,10 +85,6 @@ export function renderActiveNote(note) {
   if (note.updatedAt) facts.push('改于 ' + String(note.updatedAt));
   if (facts.length) out.push(facts.join(' / '));
 
-  let where = cursorPhrase(note);
-  if (note.heading) where += '，小节「' + cut(note.heading, MAX_HEADING) + '」';
-  out.push(where);
-
   const sel = selectionPhrase(note);
   if (sel) out.push(sel);
 
@@ -104,19 +102,46 @@ export function renderActiveNote(note) {
 }
 
 /**
- * 光标那一行 —— 每轮都带，因为「在看哪一段」随时会变，而它只占一行。
- * 拿不到就明说拿不到，不沉默：沉默会让人以为我看得见。
+ * 标记那一行 —— 只在真指着什么的时候才带：有标记，或者有一段明确选中。
+ * 什么都没指就不出声（连「没有标记」都不说，省得每轮占一行）。
  */
-export function renderCursorLine(note) {
-  if (!note || !note.path) return '【光标】没有打开的笔记';
+export function renderMarksLine(note, { cleared = false } = {}) {
+  if (!note || !note.path) return '';
+  const parts = [];
+  if (cleared) {
+    parts.push('标记已清除');
+  } else {
+    // 只报「指着哪」：没选中就是不提，不像整篇块那样还要说明「没有选中」
+    if (note.selection) {
+      const sel = selectionPhrase(note);
+      if (sel) parts.push(sel);
+    }
+    const mk = marksPhrase(note);
+    if (mk) parts.push(mk);
+  }
+  if (!parts.length) return '';
+  return '【标记】' + [shortName(note)].concat(parts).join(' · ');
+}
 
-  // 【光标】已经说明了主语，这里不再重复「光标」两个字
-  const parts = [shortName(note), cursorPhrase(note, false)];
-  if (note.heading) parts.push('小节「' + cut(note.heading, MAX_HEADING) + '」');
-  const sel = selectionPhrase(note);
-  if (sel) parts.push(sel);
-  const mk = marksPhrase(note);
-  if (mk) parts.push(mk);
-
-  return '【光标】' + parts.join(' · ');
+/** 标记（含选区）的指纹：用来判断「这一轮要不要再报一次」；什么都没指就是空串。 */
+export function marksKeyOf(note) {
+  if (!note || !note.path) return '';
+  const parts = [];
+  if (note.point && Number.isFinite(note.point.line)) {
+    parts.push('p' + note.point.line + ':' + (Number(note.point.ch) || 0));
+  }
+  for (const r of Array.isArray(note.regions) ? note.regions : []) {
+    if (!r || !r.from || !r.to) continue;
+    parts.push(
+      'r' + r.from.line + ':' + (Number(r.from.ch) || 0) + '-' + r.to.line + ':' + (Number(r.to.ch) || 0)
+    );
+  }
+  const markKey = parts.join(',');
+  const sel = note.selection;
+  const selKey =
+    sel && Number.isFinite(sel.fromLine) && Number.isFinite(sel.toLine)
+      ? sel.fromLine + ':' + (Number(sel.fromCh) || 0) + '-' + sel.toLine + ':' + (Number(sel.toCh) || 0)
+      : '';
+  if (!markKey && !selKey) return '';
+  return markKey + '|' + selKey;
 }

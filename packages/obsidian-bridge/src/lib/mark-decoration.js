@@ -43,7 +43,8 @@ function offsetOf(doc, pos) {
 
 /**
  * @param {{getMarks:()=>Array, getPath:()=>string}} deps
- * getMarks 返回 [{path, marks:[{line,ch}, …]}]，getPath 返回当前编辑器对应的文件路径
+ * getMarks 返回 [{path, point:{line,ch}|null, regions:[{from,to}, …]}]，
+ * getPath 返回当前编辑器对应的文件路径；一篇可以同时有点和多处区域
  */
 function createMarkExtension({ getMarks, getPath }) {
   const { Decoration, ViewPlugin, RangeSetBuilder, WidgetType } = loadCm();
@@ -97,27 +98,26 @@ function createMarkExtension({ getMarks, getPath }) {
           list = [];
         }
         const path = typeof getPath === 'function' ? getPath() : '';
-        const mine = list.filter((m) => m && m.path === path && Array.isArray(m.marks) && m.marks.length);
+        const mine = list.filter((m) => m && m.path === path);
 
         const items = [];
         for (const entry of mine) {
-          const pts = entry.marks.slice(0, 2);
-          if (pts.length === 1) {
-            const at = offsetOf(view.state.doc, pts[0]);
+          // 点标记：字缝里一个工字形
+          if (entry.point) {
+            const at = offsetOf(view.state.doc, entry.point);
             items.push({ from: at, to: at, deco: beamPoint, order: 0 });
-          } else {
-            const a = offsetOf(view.state.doc, pts[0]);
-            const b = offsetOf(view.state.doc, pts[1]);
+          }
+          // 区域可以有多处，各画各的
+          for (const r of Array.isArray(entry.regions) ? entry.regions : []) {
+            if (!r || !r.from || !r.to) continue;
+            const a = offsetOf(view.state.doc, r.from);
+            const b = offsetOf(view.state.doc, r.to);
             const from = Math.min(a, b);
             const to = Math.max(a, b);
-            // 同一位置不能既插 widget 又标 mark，所以空范围只画一个
-            if (from === to) {
-              items.push({ from, to, deco: beamPoint, order: 0 });
-            } else {
-              items.push({ from, to: from, deco: beamFrom, order: 0 });
-              items.push({ from, to, deco: rangeDeco, order: 1 });
-              items.push({ from: to, to, deco: beamTo, order: 2 });
-            }
+            if (from === to) continue;
+            items.push({ from, to: from, deco: beamFrom, order: 0 });
+            items.push({ from, to, deco: rangeDeco, order: 1 });
+            items.push({ from: to, to, deco: beamTo, order: 2 });
           }
         }
         // RangeSetBuilder 要求 from 递增；同位置时按 order 排（line 在 mark 之前）

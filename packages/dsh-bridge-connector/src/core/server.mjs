@@ -9,7 +9,7 @@ import { createInjectionStore } from './injection.mjs';
 import { createTitleCache, createSessionFileIndex } from './session-title.mjs';
 import { createWorkspaceIndex } from './workspace-index.mjs';
 import { readRecentMessages } from './transcript.mjs';
-import { renderActiveNote, renderCursorLine } from './active-note.mjs';
+import { renderActiveNote, renderMarksLine, marksKeyOf } from './active-note.mjs';
 import { createObsidianProbe, mergeActiveNote } from './obsidian-probe.mjs';
 
 // DSH 的工作区注册表：分组要用它，否则会多出 DSH 界面里没有的「工作区」
@@ -207,12 +207,24 @@ export function startConnector(options) {
       others: Array.isArray(payload.others)
         ? payload.others.filter((x) => typeof x === 'string' && x).slice(0, 8)
         : [],
-      // 临时标记：0 个不说，1 个是点，2 个是范围
-      marks: Array.isArray(payload.marks)
-        ? payload.marks
-            .filter((x) => x && asNum(x.line) !== null)
-            .slice(0, 2)
-            .map((x) => ({ line: asNum(x.line), ch: asNum(x.ch) || 0 }))
+      // 标记：一个点（最多一个）+ 若干处区域
+      point: payload.point && asNum(payload.point.line) !== null
+        ? { line: asNum(payload.point.line), ch: asNum(payload.point.ch) || 0 }
+        : null,
+      regions: Array.isArray(payload.regions)
+        ? payload.regions
+            .filter(
+              (r) =>
+                r &&
+                r.from && r.to &&
+                asNum(r.from.line) !== null &&
+                asNum(r.to.line) !== null
+            )
+            .slice(0, 8)
+            .map((r) => ({
+              from: { line: asNum(r.from.line), ch: asNum(r.from.ch) || 0 },
+              to: { line: asNum(r.to.line), ch: asNum(r.to.ch) || 0 },
+            }))
         : [],
       at: Date.now(),
     };
@@ -227,6 +239,8 @@ export function startConnector(options) {
   // 同一会话里，同一篇笔记的坐标只搭一次车：
   // 每轮都重复灌一遍没有任何新信息，只会把真正要说的话挤走。
   const noteSeen = new Map(); // sessionId -> Set<path>
+  // 上一轮报过的标记指纹：标记没变就不重复报，省一行提示词
+  const marksSeen = new Map(); // sessionId -> string
 
   /** 此刻的当前笔记：现查优先，问不到就用推送缓存。任何异常都不许影响投递。 */
   async function currentNote() {
@@ -494,6 +508,11 @@ export function startConnector(options) {
             title: cur.title || null,
             at: new Date(cur.at).toISOString(),
             length: cur.content.length,
+            // 节奏：每 every 轮带一次，共 times 次（0 = 不限期），已带 used 次
+            every: Number(cur.every) || 1,
+            times: Number(cur.times) || 0,
+            used: Number(cur.used) || 0,
+            remaining: Number(cur.remaining) || 0,
           })),
         },
       });
@@ -552,6 +571,9 @@ export function startConnector(options) {
           absPath,
           title: payload.title ? String(payload.title) : null,
           kind: payload.kind ? String(payload.kind) : 'context',
+          // 节奏：每 every 轮带一次；times 是总次数（0 = 不限期）
+          every: payload.every,
+          times: payload.times,
         });
         if (!record) {
           json(res, 400, { ok: false, error: { code: 'bad-args', message: '注入内容或会话无效' } });
@@ -597,18 +619,40 @@ export function startConnector(options) {
         // 坐标分两种寿命：整篇的（路径/篇幅/小节）跟会话只走一趟；
         // 光标那一句每轮都走——它随时在变，而且只占一行。
         const live = await currentNote();
-        const noteText = takeActiveNoteFor(sessionId, live) || renderCursorLine(live);
+        // 整篇坐标每个会话每篇只搭一次车；之后只在「标记变了」时补一行。
+        // 光标位置一概不看——指着哪一段由标记说。
+        let noteText = takeActiveNoteFor(sessionId, live);
+        if (noteText) {
+          marksSeen.set(sessionId, marksKeyOf(live));
+        } else {
+          const markKey = live ? marksKeyOf(live) : '';
+          const prev = marksSeen.get(sessionId) || '';
+          if (markKey !== prev) {
+            marksSeen.set(sessionId, markKey);
+            noteText = renderMarksLine(live, { cleared: markKey === '' && prev !== '' });
+          }
+        }
         const text = noteText ? noteText + '\n\n' + markSource(message) : markSource(message);
-        await sessions.prompt(
-          {
-            requestId,
-            sessionId,
-            mode: payload.mode === 'steer' ? 'steer' : 'queue',
-            content: [{ type: 'text', text }],
-            ...(clientTimeZone ? { clientTimeZone } : {}),
-          },
-          new AbortController().signal,
-        );
+        // 这一轮算第几轮：注入的「每 N 轮」靠它数。要在 prompt 之前加，
+        // 因为系统提示词是在 prompt 里组装的。
+        injectionStore.beginDelivery(sessionId);
+        try {
+          await sessions.prompt(
+            {
+              requestId,
+              sessionId,
+              mode: payload.mode === 'steer' ? 'steer' : 'queue',
+              content: [{ type: 'text', text }],
+              ...(clientTimeZone ? { clientTimeZone } : {}),
+            },
+            new AbortController().signal,
+          );
+        } catch (promptError) {
+          // 没投出去：这一轮退回去，别让「每 N 轮」白走一格、也别白吃一次次数
+          injectionStore.rollbackDelivery(sessionId);
+          throw promptError;
+        }
+        injectionStore.tick(sessionId);
         json(res, 200, { ok: true, data: { sessionId, delivered: true, requestId } });
       } catch (err) {
         json(res, 500, { ok: false, error: { code: 'prompt-failed', message: String(err?.message || err) } });

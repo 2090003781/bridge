@@ -5,10 +5,16 @@
 //      笔记改了，注入跟着变——这是「实时跟随」，不是拍快照。
 //   ② 纯正文（兼容老格式 / 客户端没给路径时的后备）：存什么就是什么。
 //
+// 频率由两个数决定（见 injection-schedule.mjs）：
+//   every —— 每几轮带一次（1 = 每次都带）
+//   times —— 一共带几次（0 = 不限期）
+// 「第几轮」按会话算：每次投递 beginDelivery 一次，注入那一刻的下一轮算第一轮。
+//
 // 落盘只存路径和元信息，不存正文：存了正文，笔记后来改了也没意义。
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { normalizeEvery, normalizeTimes, isDue } from './injection-schedule.mjs';
 
 const DEFAULT_FILE = path.join(os.homedir(), '.dsh-bridge', 'injections.json');
 // 单篇预算：注入进系统提示词、每轮都要重发，所以必须有上限。
@@ -23,11 +29,16 @@ export function createInjectionStore({
 } = {}) {
   let seq = 0;
   let current = [];
+  // 会话 -> 已经投递过几轮
+  const rounds = new Map();
+  // 这一轮该带哪些（beginDelivery 定下来，提示词段只读）
+  let dueIds = new Set();
   // id -> { mtimeMs, size, text }：文件没变就不重复读盘
   const cache = new Map();
 
   const expiring = Number.isFinite(ttlMs) && ttlMs > 0;
   const isAlive = (item) => !expiring || now() - item.at <= ttlMs;
+  const roundOf = (sid) => Number(rounds.get(sid)) || 0;
 
   if (file) {
     try {
@@ -39,6 +50,19 @@ export function createInjectionStore({
       for (const item of current) {
         const n = Number(String(item.id).replace(/^inj-/, ''));
         if (Number.isFinite(n)) seq = Math.max(seq, n);
+      }
+      if (saved.rounds && typeof saved.rounds === 'object') {
+        for (const [sid, n] of Object.entries(saved.rounds)) {
+          const v = Number(n);
+          if (Number.isFinite(v) && v > 0) rounds.set(sid, v);
+        }
+      }
+      // 老文件里没有 rounds：按条目的起始轮推一个，别让「每 N 轮」一重启就错位
+      for (const item of current) {
+        const start = Number(item.startRound);
+        if (Number.isFinite(start) && start > 0 && roundOf(item.sessionId) < start - 1) {
+          rounds.set(item.sessionId, start - 1);
+        }
       }
     } catch {
       // 没有文件、或者文件坏了：从空开始，不阻断启动
@@ -54,8 +78,10 @@ export function createInjectionStore({
         const { content, ...rest } = item;
         return rest;
       });
+      const roundMap = {};
+      for (const [sid, n] of rounds) roundMap[sid] = n;
       fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, JSON.stringify({ version: 2, seq, items }), 'utf8');
+      fs.writeFileSync(file, JSON.stringify({ version: 3, seq, rounds: roundMap, items }), 'utf8');
     } catch {
       // 落盘失败不该让本次会话的注入失效
     }
@@ -94,9 +120,32 @@ export function createInjectionStore({
     return current;
   }
 
+  // 界面要看的：还剩几次（times=0 表示不限）
+  const viewOf = (item) => {
+    const times = normalizeTimes(item.times);
+    const used = Number(item.used) || 0;
+    return {
+      ...item,
+      every: normalizeEvery(item.every),
+      times,
+      used,
+      remaining: times === 0 ? 0 : Math.max(0, times - used),
+      content: contentOf(item),
+    };
+  };
+
   return {
     // 只产出一条记录；要不要生效由调用方 markCurrent 决定。
-    add({ sessionId, content, path: notePath = null, absPath = null, title = null, kind = 'context' } = {}) {
+    add({
+      sessionId,
+      content,
+      path: notePath = null,
+      absPath = null,
+      title = null,
+      kind = 'context',
+      every = 1,
+      times = 0,
+    } = {}) {
       const sid = String(sessionId || '').trim();
       const rel = notePath ? String(notePath) : null;
       const abs = absPath ? String(absPath) : null;
@@ -105,7 +154,18 @@ export function createInjectionStore({
       // 有路径就不需要正文；没路径才要求正文
       if (!rel && (!text || !text.trim())) return null;
       seq += 1;
-      const record = { id: 'inj-' + seq, sessionId: sid, title, kind, at: now() };
+      const record = {
+        id: 'inj-' + seq,
+        sessionId: sid,
+        title,
+        kind,
+        at: now(),
+        every: normalizeEvery(every),
+        times: normalizeTimes(times),
+        used: 0,
+        // 注入那一刻的下一轮算第一轮：注入完马上那条消息就能带上
+        startRound: roundOf(sid) + 1,
+      };
       if (rel) {
         record.path = rel;
         if (abs) record.absPath = abs;
@@ -119,7 +179,7 @@ export function createInjectionStore({
 
     /** 记为「当前注入」：可多篇，同标题覆盖，超出上限丢最旧。 */
     markCurrent(record) {
-      if (!record) return current.map((x) => ({ ...x, content: contentOf(x) }));
+      if (!record) return current.map(viewOf);
       const idx = current.findIndex((x) => x.title && record.title && x.title === record.title);
       if (idx >= 0) {
         cache.delete(current[idx].id);
@@ -131,12 +191,95 @@ export function createInjectionStore({
         current = current.slice(-maxCurrent);
       }
       persist();
-      return current.map((x) => ({ ...x, content: contentOf(x) }));
+      return current.map(viewOf);
     },
 
-    /** 返回带正文的视图（每次调用都会检查文件有没有变）。 */
+    /** 状态视图：带正文和剩余次数，不改任何计数（界面轮询调用它是对的）。 */
     currentItems() {
-      return alive().map((item) => ({ ...item, content: contentOf(item) }));
+      return alive().map(viewOf);
+    },
+
+    /**
+     * 组装系统提示词时调：只返回这一轮定下来的那几篇。
+     * 纯读——计数已经在 beginDelivery 里做过了，这里被调几次都不影响。
+     */
+    carryItems() {
+      if (dueIds.size === 0) return [];
+      return alive()
+        .filter((item) => dueIds.has(item.id))
+        .map(viewOf);
+    },
+
+    /**
+     * 一条消息要投递了：这个会话的轮次 +1，顺手定下这一轮该带哪几篇。
+     * 只有这一轮到点的会被标记，并把「用过」记一次。
+     */
+    beginDelivery(sessionId) {
+      const sid = String(sessionId || '').trim();
+      if (!sid) return 0;
+      const next = roundOf(sid) + 1;
+      rounds.set(sid, next);
+      dueIds = new Set();
+      for (const item of alive()) {
+        if (item.sessionId !== sid) continue;
+        const due = isDue({
+          every: item.every,
+          times: item.times,
+          used: Number(item.used) || 0,
+          startRound: Number(item.startRound) || 0,
+          round: next,
+        });
+        if (!due) continue;
+        item.used = (Number(item.used) || 0) + 1;
+        item.lastRound = next;
+        dueIds.add(item.id);
+      }
+      persist();
+      return next;
+    },
+
+    /** 投递失败：把这一轮退回去，别让「每 N 轮」白走一格。 */
+    rollbackDelivery(sessionId) {
+      const sid = String(sessionId || '').trim();
+      if (!sid) return 0;
+      const round = roundOf(sid);
+      if (round <= 0) return 0;
+      rounds.set(sid, round - 1);
+      // 这一轮已经记过的「用过」和名单都退回
+      for (const item of current) {
+        if (Number(item.lastRound) === round) {
+          item.used = Math.max(0, (Number(item.used) || 0) - 1);
+          delete item.lastRound;
+        }
+      }
+      dueIds = new Set();
+      persist();
+      return round - 1;
+    },
+
+    /** 投递成功之后：次数带满的条目退场。 */
+    tick(sessionId) {
+      const sid = String(sessionId || '').trim();
+      const kept = [];
+      let changed = false;
+      for (const item of current) {
+        const times = normalizeTimes(item.times);
+        if (sid && item.sessionId !== sid) {
+          kept.push(item);
+          continue;
+        }
+        if (times > 0 && (Number(item.used) || 0) >= times) {
+          cache.delete(item.id);
+          changed = true;
+          continue;
+        }
+        kept.push(item);
+      }
+      if (changed) {
+        current = kept;
+        persist();
+      }
+      return current.map(viewOf);
     },
 
     clearCurrent(id) {

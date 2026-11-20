@@ -103,7 +103,8 @@ export async function apply(ctx, config = {}) {
             order: 250,
             text: () => {
               if (injectionState.on !== true) return '';
-              const items = server.injections.currentItems();
+              // carryItems 会按「每 N 轮 / 共 M 次」挑出这一轮该带的，并记一次用量
+              const items = server.injections.carryItems();
               return items.length ? renderInjection(items) : '';
             },
           });

@@ -10,6 +10,7 @@ const { pickReplyAnchor } = require('./scroll-anchor.js');
 const { HISTORY_LIMIT, transcriptState, mergeTranscript } = require('./session-context.js');
 const { rewriteLocalImages } = require('./image-embed.js');
 const { displayTextOf } = require('./panel-text.js');
+const { tailPathOf, planTree } = require('./session-tree.js');
 
 const VIEW_TYPE = 'bridge-chat';
 const RECENT_LIMIT = 15;
@@ -553,6 +554,17 @@ class BridgeChatView extends ItemView {
     await this.injectFile(file, selection);
   }
 
+  // 注入面板里选的节奏：每几轮带一次、一共带几次
+  cadenceOfInject() {
+    const s = this.plugin.settings || {};
+    const every = Number(s.injectEvery);
+    const times = Number(s.injectTimes);
+    return {
+      every: Number.isFinite(every) && every >= 1 ? Math.min(99, Math.floor(every)) : 1,
+      times: Number.isFinite(times) && times > 0 ? Math.min(99, Math.floor(times)) : 0,
+    };
+  }
+
   async injectFile(file, selection = '') {
     if (!this.sessionId) {
       this.pushSystem('还没有绑定会话。');
@@ -570,10 +582,16 @@ class BridgeChatView extends ItemView {
         content: selection || '',
         title: file.path,
         kind: 'note',
+        // 节奏：每 every 轮带一次；times 一共带几次（0 = 不限期）
+        ...this.cadenceOfInject(),
       });
       if (res && res.ok) {
         const extra = selection ? `（另附选中 ${selection.length} 字）` : '';
-        this.pushSystem(`已注入《${file.path}》${extra}——实时跟随磁盘内容，笔记改了下一轮就跟着变。`);
+        const { every, times } = this.cadenceOfInject();
+        const life =
+          (every === 1 ? '每轮都带' : `每 ${every} 轮带一次`) +
+          (times === 0 ? '，不限次数' : `，共 ${times} 次`);
+        this.pushSystem(`已注入《${file.path}》${extra}——${life}，实时跟随磁盘内容。`);
         this.refreshRemoteState();
       } else {
         this.pushSystem('注入失败：' + ((res && res.error && res.error.message) || '未知原因'));
@@ -792,6 +810,93 @@ class InjectionPanelModal extends Modal {
         }),
       );
 
+    const cadence = this.view.cadenceOfInject();
+    const describeEvery = (n) => (n === 1 ? '每轮都带' : '每 ' + n + ' 轮带一次');
+    const describeTimes = (n) => (n === 0 ? '不限期' : '共 ' + n + ' 次');
+    let everyInput = null;
+    let timesInput = null;
+    let everyDrop = null;
+    let timesDrop = null;
+
+    new Setting(c)
+      .setName('注入间隔')
+      .setDesc('每几轮带一次。正文会跟着系统提示词重发，间隔越大越省上下文')
+      .addDropdown((dd) => {
+        everyDrop = dd;
+        return dd
+          .addOption('1', '每轮都带')
+          .addOption('2', '每 2 轮')
+          .addOption('3', '每 3 轮')
+          .addOption('5', '每 5 轮')
+          .addOption('custom', '自定义…')
+          .setValue([1, 2, 3, 5].includes(cadence.every) ? String(cadence.every) : 'custom')
+          .onChange(async (v) => {
+            if (v === 'custom') {
+              // 框里已经有数就别覆盖它（那是主人刚敲的）
+              if (everyInput && !String(everyInput.getValue() || '').trim()) {
+                everyInput.setValue(String(cadence.every > 1 ? cadence.every : 3));
+              }
+              return;
+            }
+            this.plugin.settings.injectEvery = Number(v) || 1;
+            if (everyInput) everyInput.setValue('');
+            await this.plugin.saveSettings();
+            new Notice('注入间隔：' + describeEvery(this.plugin.settings.injectEvery));
+          });
+      })
+      .addText((txt) => {
+        everyInput = txt;
+        txt.setPlaceholder('自定义 1-99').onChange(async (raw) => {
+          const s = String(raw == null ? '' : raw).trim();
+          if (!s) return;
+          // 手动填了数就说明用的是自定义档位，左边的下拉跟着切过去
+          if (everyDrop) everyDrop.setValue('custom');
+          const n = Number(s);
+          this.plugin.settings.injectEvery = Number.isFinite(n) && n >= 1 ? Math.min(99, Math.floor(n)) : 1;
+          await this.plugin.saveSettings();
+          new Notice('注入间隔：' + describeEvery(this.plugin.settings.injectEvery));
+        });
+      });
+
+    new Setting(c)
+      .setName('注入次数')
+      .setDesc('一共带几次；0 或留空表示不限期（手动清除为止）')
+      .addDropdown((dd) => {
+        timesDrop = dd;
+        return dd
+          .addOption('0', '不限期')
+          .addOption('1', '只带 1 次')
+          .addOption('3', '共 3 次')
+          .addOption('5', '共 5 次')
+          .addOption('custom', '自定义…')
+          .setValue([0, 1, 3, 5].includes(cadence.times) ? String(cadence.times) : 'custom')
+          .onChange(async (v) => {
+            if (v === 'custom') {
+              if (timesInput && !String(timesInput.getValue() || '').trim()) {
+                timesInput.setValue(String(cadence.times > 0 ? cadence.times : 3));
+              }
+              return;
+            }
+            this.plugin.settings.injectTimes = Number(v) || 0;
+            if (timesInput) timesInput.setValue('');
+            await this.plugin.saveSettings();
+            new Notice('注入次数：' + describeTimes(this.plugin.settings.injectTimes));
+          });
+      })
+      .addText((txt) => {
+        timesInput = txt;
+        txt.setPlaceholder('自定义 0-99').onChange(async (raw) => {
+          const s = String(raw == null ? '' : raw).trim();
+          if (!s) return;
+          // 手动填了数就说明用的是自定义档位，左边的下拉跟着切过去
+          if (timesDrop) timesDrop.setValue('custom');
+          const n = Number(s);
+          this.plugin.settings.injectTimes = Number.isFinite(n) && n > 0 ? Math.min(99, Math.floor(n)) : 0;
+          await this.plugin.saveSettings();
+          new Notice('注入次数：' + describeTimes(this.plugin.settings.injectTimes));
+        });
+      });
+
     new Setting(c)
       .addButton((b) =>
         b.setButtonText('注入当前笔记').setCta().onClick(async () => {
@@ -862,17 +967,26 @@ class InjectionPanelModal extends Modal {
         const cur = res.data.current;
         this.statusEl.setText(`连接器：${on ? '开' : '关'}`);
         const items = Array.isArray(cur) ? cur : cur ? [cur] : [];
+        // 旧版连接器回执里没有 turns 字段：说明「带几轮」在那边不生效，
+        // 界面得直说，不然你以为只带一次、其实每轮都在发。
+        const cadenceKnown = items.every((x) => Object.prototype.hasOwnProperty.call(x, 'every'));
         if (this.injectedEl) {
           this.injectedEl.empty();
           if (items.length === 0) {
             this.injectedEl.setText('已注入：无');
           } else {
-            this.injectedEl.createDiv({ cls: 'bridge-line', text: `已注入 ${items.length} 篇：` });
+            this.injectedEl.createDiv({
+              cls: 'bridge-line',
+              text: `已注入 ${items.length} 篇：` + (cadenceKnown ? '' : '（连接器未升级，节奏不生效）'),
+            });
             for (const item of items) {
               const row = this.injectedEl.createDiv({ cls: 'bridge-injected-item' });
               row.createSpan({
                 cls: 'bridge-injected-name',
-                text: `《${item.title || '（无标题）'}》 · ${item.length} 字`,
+                text:
+                  `《${item.title || '（无标题）'}》 · ${item.length} 字` +
+                  (Number(item.every) > 1 ? ` · 每 ${item.every} 轮` : '') +
+                  (Number(item.times) > 0 ? ` · 剩 ${Math.max(0, Number(item.remaining) || 0)} 次` : ''),
               });
               const x = row.createEl('button', {
                 cls: 'bridge-injected-x',
@@ -985,11 +1099,6 @@ class NoteTreePickerModal extends Modal {
 
 // ── 会话选择树（工作区 → 会话）────────────────────────────
 
-function tailPath(p, n = 1) {
-  const parts = String(p || '').replace(/[\\/]+$/, '').split(/[\\/]+/).filter(Boolean);
-  return parts.slice(-n).join('\\') || '(无工作区)';
-}
-
 // 会话名优先用 DSH 的标题；没有就降级成「目录 · 时间 · 短 id」——总比一串 uuid 强。
 function sessionLabel(s) {
   if (s && s.title) return s.title;
@@ -998,7 +1107,7 @@ function sessionLabel(s) {
     ? `${String(when.getMonth() + 1).padStart(2, '0')}-${String(when.getDate()).padStart(2, '0')} ` +
       `${String(when.getHours()).padStart(2, '0')}:${String(when.getMinutes()).padStart(2, '0')}`
     : '';
-  return [tailPath(s && s.cwd, 1), stamp, String((s && s.sessionId) || '').slice(-6)].filter(Boolean).join(' · ');
+  return [tailPathOf(s && s.cwd, 1), stamp, String((s && s.sessionId) || '').slice(-6)].filter(Boolean).join(' · ');
 }
 
 class SessionTreeModal extends Modal {
@@ -1015,6 +1124,9 @@ class SessionTreeModal extends Modal {
     this.modalEl.addClass('bridge-tree-modal');
     // 默认全部收起：某个工作区可能有几十个会话，一展开就把其他工作区
     // 全挤到滚动区下面，看起来像「只有几个工作区」。要点哪个再展开哪个。
+    // 但当前会话所在的那个必须展开——不然你根本看不见自己在哪一篇。
+    const plan = planTree(this.sessions, this.currentId);
+    if (plan.currentKey) this.expanded.add(plan.currentKey);
     this.render();
   }
 
@@ -1029,18 +1141,8 @@ class SessionTreeModal extends Modal {
     // 分组依据是 DSH 的工作区注册表（不是会话的 cwd）：
     // 按 cwd 分会多出 DSH 界面里根本没有的「工作区」，两边对不上。
     // 归档会话在 DSH 里也不显示，这里一并过滤。
-    const visible = this.sessions.filter((s) => !s.archived);
-    const groups = new Map();
-    for (const s of visible) {
-      // workspaceTitle 是新连接器给的字段；旧连接器没有这个字段时
-      // 退回按 cwd 分组，免得升级顺序不同就全落进「未分组」。
-      const key =
-        s.workspaceTitle ||
-        (s.workspaceTitle === undefined ? tailPath(s.cwd, 2) : '(未分组)');
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push(s);
-    }
-    const archivedCount = this.sessions.length - visible.length;
+    const plan = planTree(this.sessions, this.currentId);
+    const { groups, visible, archivedCount } = plan;
     c.createDiv({
       cls: 'setting-item-description',
       text:
@@ -1048,6 +1150,7 @@ class SessionTreeModal extends Modal {
         (archivedCount ? `（已隐藏 ${archivedCount} 个归档）` : '') +
         '。点工作区展开，点会话切换。',
     });
+
     const latestOf = (list) => Math.max(0, ...list.map((x) => Date.parse(x.updatedAt) || 0));
     const ordered = [...groups.entries()].sort((a, b) => latestOf(b[1]) - latestOf(a[1]));
 
@@ -1080,7 +1183,9 @@ class SessionTreeModal extends Modal {
           cls: 'bridge-tree-row bridge-tree-file' + (active ? ' is-selected' : ''),
         });
         row.style.paddingLeft = '16px';
-        row.createSpan({ cls: 'bridge-tree-name', text: (active ? '● ' : '') + sessionLabel(s) });
+        // 和选择笔记一样用行内标记，当前会话加个圆点，不另起一行文字说明
+        if (active) row.createSpan({ cls: 'bridge-tree-dot', text: '●' });
+        row.createSpan({ cls: 'bridge-tree-name', text: sessionLabel(s) });
         row.onClickEvent(() => {
           this.close();
           try {

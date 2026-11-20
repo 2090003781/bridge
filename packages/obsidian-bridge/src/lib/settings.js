@@ -13,6 +13,9 @@ const DEFAULTS = {
   chatSessionId: '',
   chatOpen: false,
   injectionEnabled: false,
+  // 注入的节奏：每 injectEvery 轮带一次（1 = 每次都带）；injectTimes 一共带几次（0 = 不限期）
+  injectEvery: 1,
+  injectTimes: 0,
   tokenTtl: 0,
   tokenIssuedAt: 0,
 };
@@ -35,6 +38,10 @@ function normalizeSettings(raw) {
   const chatSessionId = typeof src.chatSessionId === 'string' ? src.chatSessionId : '';
   const chatOpen = typeof src.chatOpen === 'boolean' ? src.chatOpen : false;
   const injectionEnabled = typeof src.injectionEnabled === 'boolean' ? src.injectionEnabled : false;
+  const rawEvery = Number(src.injectEvery);
+  const injectEvery = Number.isFinite(rawEvery) && rawEvery >= 1 ? Math.min(99, Math.floor(rawEvery)) : 1;
+  const rawTimes = Number(src.injectTimes);
+  const injectTimes = Number.isFinite(rawTimes) && rawTimes > 0 ? Math.min(99, Math.floor(rawTimes)) : 0;
 
   return {
     enabled,
@@ -47,6 +54,8 @@ function normalizeSettings(raw) {
     chatSessionId,
     chatOpen,
     injectionEnabled,
+    injectEvery,
+    injectTimes,
     tokenTtl,
     tokenIssuedAt,
   };

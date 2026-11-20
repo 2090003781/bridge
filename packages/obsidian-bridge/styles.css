@@ -343,3 +343,16 @@
 .bridge-msg p:has(> img) {
   margin: 4px 0;
 }
+
+/* 当前会话：和选择笔记一样用行内标记——左边一个小圆点 + 一道强调色竖条 */
+.bridge-tree-dot {
+  color: var(--interactive-accent);
+  font-size: 9px;
+  line-height: 1;
+}
+.bridge-tree-file.is-selected {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+  box-shadow: inset 2px 0 0 var(--interactive-accent);
+  font-weight: 600;
+}

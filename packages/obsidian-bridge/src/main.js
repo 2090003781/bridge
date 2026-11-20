@@ -22,8 +22,17 @@ const { createConnectorClient } = require('./lib/connector-client.js');
 const { BridgeLogModal } = require('./lib/log-view.js');
 const { createPluginLog } = require('./lib/plugin-log.js');
 const { createMarkExtension, refreshAllMarkViews } = require('./lib/mark-decoration.js');
-const { nextMarkState, describeMarks, marksForPath } = require('./lib/mark-store.js');
+const {
+  emptySet,
+  setPoint,
+  addRegion,
+  removeAtCursor,
+  describeSet,
+  setForPath,
+  withSet,
+} = require('./lib/mark-store.js');
 const { createAiCursor } = require('./lib/ai-cursor.js');
+const { pickVisibleView } = require('./lib/visible-view.js');
 const { createAiCursorSync } = require('./lib/ai-cursor-sync.js');
 
 const INFO_DIR = path.join(os.homedir(), '.obsidian-bridge');
@@ -126,15 +135,29 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
     } catch (err) {
       this.logEvent('mark', '装饰层不可用，标记只能靠状态栏和播报：' + String((err && err.message) || err));
     }
+    // 四个动作，各一个键：打点 / 标选区 / 清除光标处那一处 / 全清当前篇
     this.addCommand({
-      id: 'bridge-mark-here',
-      name: '标记：标记这里（再按变范围，第三次清除）',
-      hotkeys: [{ modifiers: ['Mod', 'Shift'], key: 'm' }],
-      callback: () => this.toggleMark(),
+      id: 'bridge-mark-point',
+      name: '标记：打一个点（只有一个点，覆盖上次）',
+      hotkeys: [{ modifiers: ['Mod', 'Alt'], key: 'm' }],
+      callback: () => this.markPoint(),
+    });
+    this.addCommand({
+      id: 'bridge-mark-region',
+      name: '标记：把选区标成一处（可重复标多处）',
+      hotkeys: [{ modifiers: ['Mod', 'Alt'], key: 'r' }],
+      callback: () => this.markRegion(),
     });
     this.addCommand({
       id: 'bridge-mark-clear',
-      name: '标记：清除全部',
+      name: '标记：清除光标处这一处',
+      hotkeys: [{ modifiers: ['Mod', 'Alt', 'Shift'], key: 'm' }],
+      callback: () => this.clearMarkAtCursor(),
+    });
+    this.addCommand({
+      id: 'bridge-mark-clear-all',
+      name: '标记：全清当前这篇',
+      hotkeys: [{ modifiers: ['Mod', 'Alt', 'Shift'], key: 'r' }],
       callback: () => this.clearMarks(),
     });
 
@@ -142,13 +165,22 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
     this.registerEvent(
       this.app.workspace.on('editor-menu', (menu) => {
         menu.addItem((item) =>
-          item
-            .setTitle('Bridge：标记这里（再点一次成范围）')
-            .setIcon('highlighter')
-            .onClick(() => this.toggleMark()),
+          item.setTitle('Bridge：打一个点').setIcon('dot').onClick(() => this.markPoint()),
         );
         menu.addItem((item) =>
-          item.setTitle('Bridge：清除标记').setIcon('eraser').onClick(() => this.clearMarks()),
+          item
+            .setTitle('Bridge：把选区标成一处')
+            .setIcon('highlighter')
+            .onClick(() => this.markRegion()),
+        );
+        menu.addItem((item) =>
+          item
+            .setTitle('Bridge：清除光标处这一处')
+            .setIcon('eraser')
+            .onClick(() => this.clearMarkAtCursor()),
+        );
+        menu.addItem((item) =>
+          item.setTitle('Bridge：全清当前这篇').setIcon('trash').onClick(() => this.clearMarks()),
         );
       }),
     );
@@ -271,35 +303,72 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
     return null;
   }
 
-  // 标记：一个快捷键搞定「点 → 范围 → 清空」三种结果，不用记两个键。
-  toggleMark() {
+  // 改标记的统一出口：写回、重画、播报、通知连接器
+  applyMarkSet(file, set, notice) {
+    this._marks = withSet(this._marks, file.path, set);
+    this.refreshMarkViews();
+    this.renderMarkStatus();
+    new Notice(notice);
+    if (typeof this._flushActiveNote === 'function') this._flushActiveNote();
+  }
+
+  markTarget() {
     const view = this.topMarkdownView();
     const file = view && view.file;
     const editor = view && view.editor;
     if (!file || !editor) {
       new Notice('没有打开的笔记，先点开一篇再标记');
-      return;
+      return null;
     }
     const cursor = typeof editor.getCursor === 'function' ? editor.getCursor() : null;
-    const current = marksForPath(this._marks, file.path);
-    const next = nextMarkState(current, cursor);
-    const kept = this._marks.filter((m) => m.path !== file.path);
-    if (next.marks.length) kept.push({ path: file.path, marks: next.marks });
-    this._marks = kept;
-    this.refreshMarkViews();
-    const desc = describeMarks(next.marks);
-    new Notice(desc || '标记已清除');
-    this.renderMarkStatus();
-    // 标记变了立刻告诉连接器，别等下一次切换
-    if (typeof this._flushActiveNote === 'function') this._flushActiveNote();
+    return { file, editor, cursor };
   }
 
+  // 打点：只有一个点，再打就把旧点挪过去（区域不动）
+  markPoint() {
+    const hit = this.markTarget();
+    if (!hit) return;
+    const set = setPoint(setForPath(this._marks, hit.file.path), hit.cursor);
+    this.applyMarkSet(hit.file, set, describeSet(set));
+  }
+
+  // 标选区：把当前选区追加成一处，可以反复标多处（像 Ctrl 不连续选择）
+  markRegion() {
+    const hit = this.markTarget();
+    if (!hit) return;
+    const sel = typeof hit.editor.getSelection === 'function' ? hit.editor.getSelection() : '';
+    if (!sel) {
+      new Notice('先选中一段文字，再按这个键');
+      return;
+    }
+    const from = hit.editor.getCursor('from');
+    const to = hit.editor.getCursor('to');
+    const set = addRegion(setForPath(this._marks, hit.file.path), from, to);
+    this.applyMarkSet(hit.file, set, describeSet(set));
+  }
+
+  // 清除光标处那一处：先看区域（光标在范围内或同一行），再看点
+  clearMarkAtCursor() {
+    const hit = this.markTarget();
+    if (!hit) return;
+    const current = setForPath(this._marks, hit.file.path);
+    const r = removeAtCursor(current, hit.cursor);
+    if (!r.removed) {
+      new Notice('光标处没有标记');
+      return;
+    }
+    this.applyMarkSet(hit.file, r.set, describeSet(r.set) || '这一处已清除');
+  }
+
+  // 全清：只清当前这篇，别的笔记上的标记不动
   clearMarks() {
-    this._marks = [];
-    this.refreshMarkViews();
-    this.renderMarkStatus();
-    new Notice('标记已清除');
-    if (typeof this._flushActiveNote === 'function') this._flushActiveNote();
+    const view = this.topMarkdownView();
+    const file = view && view.file;
+    if (!file) {
+      new Notice('没有打开的笔记');
+      return;
+    }
+    this.applyMarkSet(file, emptySet(), '当前这篇的标记已全清');
   }
 
   // 标记是外部状态，CodeMirror 不知道它变了：dispatch 一个空事务把装饰层叫醒
@@ -320,9 +389,10 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
     if (!this.markStatusEl) this.markStatusEl = this.addStatusBarItem();
     const view = this.topMarkdownView();
     const file = view && view.file;
-    const marks = file ? marksForPath(this._marks, file.path) : [];
-    this.markStatusEl.setText(describeMarks(marks));
-    this.markStatusEl.style.display = marks.length ? '' : 'none';
+    const set = file ? setForPath(this._marks, file.path) : emptySet();
+    const text = describeSet(set);
+    this.markStatusEl.setText(text);
+    this.markStatusEl.style.display = text ? '' : 'none';
   }
 
   // 当前打开的笔记 —— 只推「坐标」，不推正文。
@@ -368,21 +438,21 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
     // 所以焦点不可靠；这里直接问布局「哪个 markdown 标签现在是活的」。
     const mainMarkdownView = () => {
       const ws = this.app.workspace;
-      const hits = [];
-      const walk = (node, depth) => {
-        if (!node || depth > 8) return;
-        if (typeof node.getActiveLeaf === 'function') {
-          const leaf = node.getActiveLeaf();
-          if (leaf && isMdView(leaf.view)) hits.push(leaf.view);
-        }
-        for (const child of node.children || []) walk(child, depth + 1);
-      };
+      let preferred = null;
       try {
-        walk(ws.rootSplit, 0);
+        const root = ws.rootSplit;
+        const leaf = root && typeof root.getActiveLeaf === 'function' ? root.getActiveLeaf() : null;
+        preferred = (leaf && leaf.view) || null;
       } catch {
         /* 布局还在重建 */
       }
-      return hits[0] || null;
+      try {
+        // 认「标签组当前选中的那一页」：焦点跑到面板上时，活动 leaf 记的
+        // 是你上次点过的那页，可能和眼睛看到的不是同一篇。
+        return pickVisibleView(ws.rootSplit, isMdView, preferred) || null;
+      } catch {
+        return null;
+      }
     };
 
     const readActive = () => {
@@ -467,8 +537,9 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
         selection,
         heading: cursor ? headingAt(text, cursor.line) : null,
         others: others.slice(0, 8),
-        // 当前这篇上的临时标记（最多两个：点 / 范围）
-        marks: marksForPath(this._marks, file.path).slice(0, 2),
+        // 当前这篇上的标记：一个点 + 若干处区域
+        point: setForPath(this._marks, file.path).point,
+        regions: setForPath(this._marks, file.path).regions,
         // 明确告诉连接器「选区这事我查过了」，免得它把「不知道」说成「没有」
         checked: true,
       };
@@ -483,8 +554,15 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
         d.updatedAt,
       ].join('|');
 
+    // 推送正在进行时又来了一次：记下来，等这一趟发完立刻补发。
+    // 以前这里直接 return，快速切标签时最后一次状态就永远丢了——
+    // 缓存停在旧的一篇，投递时探针再一失败就会照旧的报出去。
+    let queued = false;
     const flush = async (force) => {
-      if (inflight) return;
+      if (inflight) {
+        queued = true;
+        return;
+      }
       const cur = readActive();
       if (!cur) {
         // 一篇 Markdown 都没开着（全关了）：才清空，
@@ -522,6 +600,11 @@ module.exports = class ObsidianBridgePlugin extends Plugin {
         }
       } finally {
         inflight = false;
+        // 这一趟期间又被叫过：立刻补一趟，别让最后一次状态留在门外
+        if (queued) {
+          queued = false;
+          flush(true).catch(() => {});
+        }
       }
     };
 
@@ -981,10 +1064,28 @@ class BridgeSettingTab extends PluginSettingTab {
     // 标记快捷键：这里读写的是 Obsidian 的 hotkeyManager 本身，
     // 不自己存一份——设置页改的、快捷键页看到的、实际生效的，三处同一个真相。
     this.addHotkeySetting(containerEl, {
-      commandId: 'obsidian-bridge:bridge-mark-here',
-      name: '标记快捷键',
-      desc: '在光标处打标记；再按一次成范围，第三次清除。',
-      defaults: [{ modifiers: ['Mod', 'Shift'], key: 'm' }],
+      commandId: 'obsidian-bridge:bridge-mark-point',
+      name: '打一个点',
+      desc: '落一个点当指引光标；只有一个点，再按就把点挪过去。',
+      defaults: [{ modifiers: ['Mod', 'Alt'], key: 'm' }],
+    });
+    this.addHotkeySetting(containerEl, {
+      commandId: 'obsidian-bridge:bridge-mark-region',
+      name: '把选区标成一处',
+      desc: '选中一段再按，追加一处区域；可以反复标多处。',
+      defaults: [{ modifiers: ['Mod', 'Alt'], key: 'r' }],
+    });
+    this.addHotkeySetting(containerEl, {
+      commandId: 'obsidian-bridge:bridge-mark-clear',
+      name: '清除光标处这一处',
+      desc: '光标在哪处标记上就删哪处（区域优先，点看同一行）。',
+      defaults: [{ modifiers: ['Mod', 'Alt', 'Shift'], key: 'm' }],
+    });
+    this.addHotkeySetting(containerEl, {
+      commandId: 'obsidian-bridge:bridge-mark-clear-all',
+      name: '全清当前这篇',
+      desc: '把当前这篇的点、所有区域一次清掉；别的笔记不受影响。',
+      defaults: [{ modifiers: ['Mod', 'Alt', 'Shift'], key: 'r' }],
     });
 
     new Setting(containerEl)
