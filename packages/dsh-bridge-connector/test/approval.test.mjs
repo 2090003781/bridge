@@ -160,6 +160,40 @@ test('DSH 那边先定了：挂住的请求跟着结束，不会一直挂着', a
   const got = await Promise.race([pending, new Promise((r) => setTimeout(() => r('hung'), 2000))]);
   assert.equal(got, 'rejected', '被拒绝也要立刻把挂起的 promise 结掉');
 });
+
+test('自动放行档：Bridge 工具不留痕，别的工具照样提示', async (t) => {
+  const ctx = await boot(t);
+  await fetch(`${ctx.base}/approval/mode`, {
+    method: 'POST',
+    headers: hdr,
+    body: JSON.stringify({ sessionId: 's1', mode: 'auto' }),
+  });
+  const keepBridge = ctx.server.noteEvent('s1', {
+    type: 'approval/asked',
+    data: { id: 'auto1', toolName: 'mcp__bridge__obsidian_call' },
+  });
+  assert.equal(keepBridge, false, '自动放行不留痕，面板不该闪一下');
+  const list = await (await fetch(`${ctx.base}/approvals?sessionId=s1`, { headers: hdr })).json();
+  assert.equal(list.data.pending.length, 0);
+
+  const keepOther = ctx.server.noteEvent('s1', {
+    type: 'approval/asked',
+    data: { id: 'auto2', toolName: 'pwsh' },
+  });
+  assert.equal(keepOther, true, '不是 Bridge 工具就照常提示');
+});
+
+test('切到自动放行会把已经挂着的条目清掉', async (t) => {
+  const ctx = await boot(t);
+  ctx.server.noteEvent('s1', { type: 'approval/asked', data: { id: 'x1', toolName: 'mcp__bridge__obsidian_call' } });
+  assert.equal(ctx.server.approvals.pendingFor('s1').length, 1);
+  await fetch(`${ctx.base}/approval/mode`, {
+    method: 'POST',
+    headers: hdr,
+    body: JSON.stringify({ sessionId: 's1', mode: 'auto' }),
+  });
+  assert.equal(ctx.server.approvals.pendingFor('s1').length, 0);
+});
 test('只认带 obsidian_ 前缀的工具，不靠理由里的关键字', async (t) => {
   const ctx = await boot(t);
   const isBridge = ctx.server.approvals.isBridgeTool;

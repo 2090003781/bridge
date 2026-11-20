@@ -770,6 +770,12 @@ export function startConnector(options) {
         return;
       }
       modeState.setMode(sessionId, mode);
+      // 切到自动放行时，把这一会话已经挂着的提示清掉，别留着一条点不动的。
+      if (mode === 'auto') {
+        for (const [key, row] of pendingApprovals) {
+          if (row && row.sessionId === sessionId) pendingApprovals.delete(key);
+        }
+      }
       json(res, 200, { ok: true, data: { sessionId, mode } });
       return;
     }
@@ -847,7 +853,9 @@ export function startConnector(options) {
             const data = (event && event.data) || {};
             if (type === 'approval/asked') {
               const id = String(data.id || '');
-              if (!id) return;
+              if (!id) return true;
+              // 自动放行档下，Bridge 工具的审批连痕迹都不留：不进列表、也不推给面板。
+              if (isBridgeTool(data.toolName) && modeState.modeFor(String(sessionId || '')) === 'auto') return false;
               pendingApprovals.set(id, {
                 id,
                 sessionId: String(sessionId || ''),
@@ -856,7 +864,7 @@ export function startConnector(options) {
                 reason: String(data.reason || ''),
                 at: Date.now(),
               });
-              return;
+              return true;
             }
             if (type === 'approval/decided') {
               const id = String(data.id || '');
@@ -869,8 +877,10 @@ export function startConnector(options) {
                 else pendingDecisions.delete(id);
               }
             }
+            return true;
           } catch {
             /* 记事件绝不影响会话 */
+            return true;
           }
         },
         approvals: {

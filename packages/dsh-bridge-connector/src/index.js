@@ -135,9 +135,9 @@ export async function apply(ctx, config = {}) {
 
   ctx.on('session/event', (session, event) => {
     try {
-      server.broadcast(session?.id, event);
+      // 先记账：自动放行档下 Bridge 工具的审批返回 false，那条就别再推给面板了。
       // 审批请求/决定也记一笔：面板据此显示「卡在等人点头」
-      server.noteEvent(session?.id, event);
+      if (server.noteEvent(session?.id, event) !== false) server.broadcast(session?.id, event);
     } catch {
       /* 监听器绝不打断会话 */
     }
