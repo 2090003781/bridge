@@ -103,3 +103,11 @@ test('通知（没有 id）不产生响应', async () => {
   const res = await handler.handle({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} });
   assert.equal(res, null);
 });
+
+test('MCP 工具名全都带 obsidian_ 前缀（审批放行靠这个前缀认人）', () => {
+  const { TOOLS } = require('../src/lib/mcp-handler.js');
+  assert.ok(Array.isArray(TOOLS) && TOOLS.length >= 8, '工具表不该是空的');
+  for (const tool of TOOLS) {
+    assert.match(tool.name, /^obsidian_[A-Za-z0-9_]+$/, tool.name + ' 没有 obsidian_ 前缀');
+  }
+});

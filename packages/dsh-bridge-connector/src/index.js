@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { startConnector } from './core/server.mjs';
+import { startConnector, sessionIdOf } from './core/server.mjs';
 import { renderInjection } from './core/injection.mjs';
 import { createStateStore } from './core/state.mjs';
 
@@ -67,6 +67,20 @@ export async function apply(ctx, config = {}) {
     },
   };
 
+  // 审批三档（每会话，落盘）：notify 只提示 / ask 转发到面板等人点 / auto 直接放行
+  const APPROVAL_MODES = ['notify', 'ask', 'auto'];
+  const approvalModes = new Map(Object.entries(savedState.approvalModes || {}));
+  const approvalState = {
+    modeFor: (sessionId) => approvalModes.get(String(sessionId || '')) || 'notify',
+    setMode: (sessionId, mode) => {
+      const key = String(sessionId || '');
+      if (!key || !APPROVAL_MODES.includes(mode)) return;
+      if (mode === 'notify') approvalModes.delete(key);
+      else approvalModes.set(key, mode);
+      stateStore.save({ approvalModes: Object.fromEntries(approvalModes) });
+    },
+  };
+
   let server = null;
   let lastError = null;
   for (let offset = 0; offset < 5; offset += 1) {
@@ -80,6 +94,7 @@ export async function apply(ctx, config = {}) {
         injectionTtlMs: Number(config.injectionTtlMs) || undefined,
         injectionFile: INJECTION_FILE,
         injectionState,
+        approvalState,
         workspaceRegistry,
       });
       break;
@@ -121,10 +136,41 @@ export async function apply(ctx, config = {}) {
   ctx.on('session/event', (session, event) => {
     try {
       server.broadcast(session?.id, event);
+      // 审批请求/决定也记一笔：面板据此显示「卡在等人点头」
+      server.noteEvent(session?.id, event);
     } catch {
       /* 监听器绝不打断会话 */
     }
   });
+
+  // 审批应答：按会话档位处理，而且只认带 obsidian_ 前缀的 Bridge 工具。
+  //   notify —— 什么都不做，交回下一个应答者（面板那边只负责提示）
+  //   auto   —— 直接允许一次
+  //   ask    —— 挂住请求、推到面板，等主人点允许/拒绝；超时就交回
+  try {
+    // prepend：排在浏览器那个应答者前面，否则「自动放行」根本轮不到我们说话。
+    ctx.on('approval/request', async function handleApproval(req, next) {
+      try {
+        const agent = req && req.agent;
+        const sessionId = sessionIdOf(agent);
+        if (!sessionId || !server) return next();
+        const mode = server.approvals.modeFor(sessionId);
+        if (mode === 'notify') return next();
+        if (!server.approvals.isBridgeTool(req && req.toolName)) return next();
+        if (mode === 'auto') {
+          ctx.logger?.info?.('[bridge-connector] 自动放行审批：' + String((req && req.toolName) || ''));
+          return 'allowed-once';
+        }
+        // ask：转发到面板，等人点；超时或面板没开就交回下一个应答者
+        const outcome = await server.approvals.requestDecision(sessionId, req);
+        return outcome || next();
+      } catch {
+        return next();
+      }
+    }, { prepend: true });
+  } catch (error) {
+    ctx.logger?.warn?.('[bridge-connector] 注册审批应答失败：' + String((error && error.message) || error));
+  }
 
   writeInfo({
     service: 'dsh-bridge-connector',

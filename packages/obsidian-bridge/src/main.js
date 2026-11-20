@@ -933,13 +933,39 @@ class BridgeSettingTab extends PluginSettingTab {
       }
     };
 
+    // 写完立刻回读：setHotkeys 不报错也可能没真的挂上（键位冲突、命令没注册完），
+    // 不回读的话界面会显示「已绑定」，实际按下去什么都不会发生。
     const write = (list) => {
       try {
         mgr.setHotkeys(commandId, list);
-        return true;
       } catch (err) {
         new Notice('写入快捷键失败：' + String((err && err.message) || err));
         return false;
+      }
+      const after = readCurrent();
+      if (list.length === 0) return after.length === 0;
+      const same =
+        after.length === list.length &&
+        after.every(
+          (h, i) =>
+            h &&
+            list[i] &&
+            h.key === list[i].key &&
+            String(h.modifiers || []).join('+') === String(list[i].modifiers || []).join('+'),
+        );
+      if (!same) {
+        new Notice('快捷键没挂上：Obsidian 没接受这个组合（可能被别的命令占了）。换一个，或者点右边的「快捷键面板」在那边设。', 8000);
+        return false;
+      }
+      return true;
+    };
+
+    const openHotkeysPanel = () => {
+      try {
+        this.app.setting.open();
+        this.app.setting.openTabById('hotkeys');
+      } catch {
+        new Notice('打不开快捷键面板，手动走 设置 → 快捷键，搜「Bridge」');
       }
     };
 
@@ -1009,6 +1035,8 @@ class BridgeSettingTab extends PluginSettingTab {
           if (write([pending])) {
             new Notice('标记快捷键已设为 ' + this.formatHotkeys([pending]));
             redraw();
+          } else {
+            openHotkeysPanel();
           }
         }),
       );
@@ -1026,11 +1054,16 @@ class BridgeSettingTab extends PluginSettingTab {
           }),
       );
 
+      // 直接跳到 Obsidian 自己的面板：那边是权威，也是出问题时唯一确定能设上的地方
+      setting.addExtraButton((btn) =>
+        btn.setIcon('keyboard').setTooltip('打开 Obsidian 快捷键面板').onClick(() => openHotkeysPanel()),
+      );
+
       // 恢复默认
       setting.addExtraButton((btn) =>
         btn
           .setIcon('rotate-ccw')
-          .setTooltip('恢复默认（Ctrl/Cmd+Shift+M）')
+          .setTooltip('恢复默认')
           .onClick(() => {
             if (write(defaults)) {
               new Notice('已恢复默认快捷键');

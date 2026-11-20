@@ -66,6 +66,7 @@ class BridgeChatView extends ItemView {
     // 不做定时轮询：窗口拿回焦点时对一次账（注入开关变了、或者断线期间漏了事件）
     this.registerDomEvent(window, 'focus', () => {
       this.refreshRemoteState();
+      this.refreshUsage();
     });
 
     await this.ensureSession();
@@ -177,6 +178,22 @@ class BridgeChatView extends ItemView {
       attr: { placeholder: '跟 DSH 说点什么…（Enter 发送，Shift+Enter 换行）', rows: '3' },
     });
     const bar = inputWrap.createDiv({ cls: 'bridge-composer-bar' });
+    // 上下文占用贴左边：还剩多少空间一眼能看到，不用去翻 DSH
+    this.usageEl = bar.createDiv({ cls: 'bridge-composer-usage' });
+    this.usageEl.setText('上下文 —');
+
+    // 审批三档：提示 / 批准（转发到这里点）/ 放行（自动通过）。点一下循环。
+    this.approvalBtn = bar.createEl('button', {
+      cls: 'bridge-composer-btn bridge-approval-btn',
+      text: '提示',
+    });
+    this._approvalMode = 'notify';
+    this.updateApprovalBtn();
+    this.approvalBtn.onClickEvent(() => this.cycleApprovalMode());
+
+    // 面板内批准：挂在这里的请求可以直接点允许/拒绝，不用切到 DSH 页面
+    this.approvalArea = inputWrap.createDiv({ cls: 'bridge-approval-area' });
+    this._approvals = [];
 
     // 回到底部：一开始禁用，往上翻历史时才亮起来
     this.jumpEl = bar.createEl('button', { cls: 'bridge-composer-btn bridge-jump-bottom', text: '↓' });
@@ -269,6 +286,8 @@ class BridgeChatView extends ItemView {
     this.refreshLocalState();
     this.connect();
     this.loadHistory();
+    this.refreshUsage();
+    this.refreshApprovals();
   }
 
   // 合并盒（攒着还没发的那几条）在切会话时清掉，但话得留着：
@@ -451,6 +470,36 @@ class BridgeChatView extends ItemView {
       }
       this.render();
       this.setStatus('就绪');
+      this.refreshUsage();
+      return;
+    }
+    if (type === 'bridge/approval-request') {
+      const d = event.data || {};
+      const id = String(d.id || '');
+      const rest = (this._approvals || []).filter((x) => x.id !== id);
+      this._approvals = rest.concat([
+        { id, answerable: d.answerable === true, toolName: String(d.toolName || ''), reason: String(d.reason || '') },
+      ]);
+      this.renderPendingApprovals();
+      new Notice('Bridge 在等你批准：' + (d.toolName || '某个操作'), 8000);
+      return;
+    }
+    if (type === 'bridge/approval-decided') {
+      const d = event.data || {};
+      this._approvals = (this._approvals || []).filter((x) => x.id !== String(d.id || ''));
+      this.renderPendingApprovals();
+      return;
+    }
+    if (type === 'approval/asked') {
+      const d = event.data || {};
+      const tool = String(d.toolName || '某个操作');
+      const why = d.reason ? '：' + String(d.reason).slice(0, 160) : '';
+      new Notice('Bridge 在等你批准：' + tool + why, 8000);
+      this.refreshApprovals();
+      return;
+    }
+    if (type === 'approval/decided') {
+      this.refreshApprovals();
       return;
     }
     if (type === 'tool-call') {
@@ -552,6 +601,136 @@ class BridgeChatView extends ItemView {
     const editor = activeView && activeView.editor;
     const selection = editor && typeof editor.getSelection === 'function' ? editor.getSelection() : '';
     await this.injectFile(file, selection);
+  }
+
+  // 审批三档循环：只提示 → 面板批准 → 自动放行
+  async cycleApprovalMode() {
+    if (!this.sessionId) {
+      new Notice('还没有绑定会话');
+      return;
+    }
+    const order = ['notify', 'ask', 'auto'];
+    const next = order[(order.indexOf(this._approvalMode) + 1) % order.length];
+    const res = await this.plugin.connector().setApprovalMode(this.sessionId, next);
+    if (!res || res.ok !== true) {
+      new Notice('切换失败：连接器未响应（DSH 未启动或版本过旧）');
+      return;
+    }
+    this._approvalMode = (res.data && res.data.mode) || next;
+    this.updateApprovalBtn();
+    new Notice('Bridge 工具审批：' + this.approvalLabel(this._approvalMode));
+    this.refreshApprovals();
+  }
+
+  approvalLabel(mode) {
+    if (mode === 'auto') return '自动放行';
+    if (mode === 'ask') return '在面板里批准';
+    return '只提示';
+  }
+
+  updateApprovalBtn() {
+    if (!this.approvalBtn) return;
+    const mode = this._approvalMode || 'notify';
+    this.approvalBtn.setText(this.approvalLabel(mode));
+    this.approvalBtn.toggleClass('is-on', mode === 'auto');
+    this.approvalBtn.toggleClass('is-ask', mode === 'ask');
+    this.approvalBtn.title =
+      mode === 'auto'
+        ? '本会话的 Bridge 工具审批自动通过（点一下切到「只提示」）'
+        : mode === 'ask'
+          ? 'Bridge 工具审批转发到面板，由你点允许/拒绝'
+          : '只在面板里提示，不代为应答';
+  }
+
+  // 待批列表：面板内直接点允许/拒绝
+  renderPendingApprovals() {
+    const el = this.approvalArea;
+    if (!el) return;
+    el.empty();
+    if (!Array.isArray(this._approvals) || !this._approvals.length) return;
+    for (const item of this._approvals) {
+      const row = el.createDiv({ cls: 'bridge-approval-item' });
+      const text = row.createDiv({ cls: 'bridge-approval-text' });
+      text.createSpan({ cls: 'bridge-approval-tool', text: item.toolName || 'Bridge 工具' });
+      if (item.reason) text.createSpan({ cls: 'bridge-approval-reason', text: ' · ' + String(item.reason).slice(0, 120) });
+      if (item.answerable !== true) { text.createSpan({ cls: 'bridge-approval-hint', text: ' · 去 DSH 窗口批准' }); continue; }
+      const allow = row.createEl('button', { cls: 'bridge-approval-yes', text: '允许' });
+      allow.onClickEvent(() => this.answerApproval(item.id, 'allow'));
+      const deny = row.createEl('button', { cls: 'bridge-approval-no', text: '拒绝' });
+      deny.onClickEvent(() => this.answerApproval(item.id, 'deny'));
+    }
+  }
+
+  answerApproval(id, decision) {
+    return this.plugin
+      .connector()
+      .answerApproval(id, decision)
+      .then((res) => {
+        if (!res || res.ok !== true) {
+          new Notice((res && res.error && res.error.message) || '这个审批已经处理过或超时了');
+        }
+        this._approvals = (this._approvals || []).filter((x) => x.id !== id);
+        this.renderPendingApprovals();
+      })
+      .catch(() => {});
+  }
+
+  // 拉一次待批列表：有的话在面板里说清楚，别让人对着「卡住」发呆
+  refreshApprovals() {
+    const sessionId = this.sessionId;
+    if (!sessionId) return Promise.resolve();
+    return this.plugin
+      .connector()
+      .approvals(sessionId)
+      .then((res) => {
+        if (this.sessionId !== sessionId) return;
+        const data = (res && res.ok === true && res.data) || null;
+        if (!data) return;
+        if (data.mode) this._approvalMode = data.mode;
+        this._approvals = Array.isArray(data.pending) ? data.pending : [];
+        this.updateApprovalBtn();
+        this.renderPendingApprovals();
+      })
+      .catch(() => {});
+  }
+
+  // 上下文占用：窗口有多大、这次请求用了多少（数据来自连接器读会话日志）
+  refreshUsage() {
+    if (!this.usageEl) return Promise.resolve();
+    const sessionId = this.sessionId;
+    if (!sessionId) {
+      this.usageEl.setText('上下文 —');
+      return Promise.resolve();
+    }
+    const fmt = (n) => {
+      const v = Number(n) || 0;
+      if (v >= 1000000) return (v / 1000000).toFixed(1) + 'M';
+      if (v >= 1000) return Math.round(v / 1000) + 'k';
+      return String(v);
+    };
+    return this.plugin
+      .connector()
+      .usage(sessionId)
+      .then((res) => {
+        if (!this.usageEl || this.sessionId !== sessionId) return;
+        const data = (res && res.ok === true && res.data) || null;
+        if (!data) {
+          this.usageEl.setText('上下文 —');
+          return;
+        }
+        const percent = Number(data.percent);
+        const hasPercent = Number.isFinite(percent);
+        const text = hasPercent
+          ? '上下文 ' + percent.toFixed(1) + '%' +
+            (data.window ? '（' + fmt(data.used) + ' / ' + fmt(data.window) + '）' : '')
+          : '上下文 ' + fmt(data.used) + ' tokens';
+        this.usageEl.setText(text);
+        this.usageEl.toggleClass('is-warn', hasPercent && percent >= 70 && percent < 90);
+        this.usageEl.toggleClass('is-danger', hasPercent && percent >= 90);
+      })
+      .catch(() => {
+        if (this.usageEl && this.sessionId === sessionId) this.usageEl.setText('上下文 —');
+      });
   }
 
   // 注入面板里选的节奏：每几轮带一次、一共带几次
